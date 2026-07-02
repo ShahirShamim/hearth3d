@@ -1,0 +1,7 @@
+# Generated project output (run ./setup.sh to recreate)
+/hearth3d/
+
+.env
+node_modules/
+dist/
+.DS_Store
