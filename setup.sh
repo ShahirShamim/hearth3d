@@ -118,8 +118,9 @@ let registryRefreshTimer = null;
 // Dashboard customization, persisted to disk and shared by all browsers:
 // { devices: { id: { x, y, room, hidden, name } },
 //   rooms:   { id: { hidden, floor, name } },
-//   roomOrder: [area_id], floors: [{ id, name }] }
-let layout = { devices: {}, rooms: {}, roomOrder: [], floors: [] };
+//   roomOrder: [area_id], floors: [{ id, name }],
+//   settings: { background } }
+let layout = { devices: {}, rooms: {}, roomOrder: [], floors: [], settings: {} };
 let layoutSaveTimer = null;
 
 try {
@@ -130,7 +131,7 @@ try {
 }
 
 function sanitizeLayout(input) {
-  const out = { devices: {}, rooms: {}, roomOrder: [], floors: [] };
+  const out = { devices: {}, rooms: {}, roomOrder: [], floors: [], settings: {} };
   if (!input || typeof input !== 'object') return out;
   const str = (v, max = 80) => (typeof v === 'string' && v.length > 0 ? v.slice(0, max) : undefined);
   if (input.devices && typeof input.devices === 'object') {
@@ -166,6 +167,10 @@ function sanitizeLayout(input) {
       .filter((f) => f && typeof f === 'object' && typeof f.id === 'string' && typeof f.name === 'string')
       .map((f) => ({ id: f.id.slice(0, 60), name: f.name.slice(0, 60) }))
       .slice(0, 50);
+  }
+  if (input.settings && typeof input.settings === 'object') {
+    const background = str(input.settings.background, 40);
+    if (background) out.settings.background = background;
   }
   return out;
 }
@@ -1058,6 +1063,142 @@ export function defaultPos(index, count) {
 EOF
 
 # ---------------------------------------------------------------------------
+# Frontend: frontend/src/utils/themes.js
+# ---------------------------------------------------------------------------
+cat > frontend/src/utils/themes.js <<'EOF'
+/**
+ * Scene background themes. `swatch` is a CSS preview gradient for the picker;
+ * the remaining fields drive the Three.js stage (background/fog color, ground
+ * plane, grid line colors, ambient level, particle field, star dome).
+ */
+export const THEMES = [
+  {
+    id: 'midnight',
+    name: 'Midnight',
+    swatch: 'linear-gradient(135deg, #020617 0%, #10233f 100%)',
+    bg: '#020617',
+    floor: '#040a16',
+    ambient: 0.65,
+    grid: ['#12203a', '#0a1424'],
+    sparkles: { color: '#7dd3fc', count: 140, size: 1.6, speed: 0.25, opacity: 0.35 },
+  },
+  {
+    id: 'starfield',
+    name: 'Starfield',
+    swatch: 'radial-gradient(circle at 30% 30%, #16204a 0%, #01030d 70%)',
+    bg: '#01030d',
+    floor: '#02040c',
+    ambient: 0.6,
+    grid: ['#0d1830', '#070f20'],
+    stars: true,
+  },
+  {
+    id: 'synthwave',
+    name: 'Synthwave',
+    swatch: 'linear-gradient(135deg, #2a0a4a 0%, #0d0221 55%, #ff2d95 130%)',
+    bg: '#0d0221',
+    floor: '#08021a',
+    ambient: 0.6,
+    grid: ['#ff2d95', '#2a0a4a'],
+    sparkles: { color: '#f472b6', count: 120, size: 1.8, speed: 0.35, opacity: 0.4 },
+  },
+  {
+    id: 'aurora',
+    name: 'Aurora',
+    swatch: 'linear-gradient(135deg, #02100e 0%, #0b4f3d 100%)',
+    bg: '#02100e',
+    floor: '#03130f',
+    ambient: 0.62,
+    grid: ['#0e3b2e', '#06231c'],
+    sparkles: { color: '#34d399', count: 160, size: 1.7, speed: 0.2, opacity: 0.4 },
+  },
+  {
+    id: 'ember',
+    name: 'Ember',
+    swatch: 'linear-gradient(135deg, #140803 0%, #7c2d12 130%)',
+    bg: '#140803',
+    floor: '#0d0502',
+    ambient: 0.55,
+    grid: ['#3b1a0e', '#241008'],
+    sparkles: { color: '#fb923c', count: 130, size: 1.5, speed: 0.45, opacity: 0.4 },
+  },
+  {
+    id: 'snowfall',
+    name: 'Snowfall',
+    swatch: 'linear-gradient(135deg, #0a1220 0%, #3a4f6e 130%)',
+    bg: '#0a1220',
+    floor: '#0c1526',
+    ambient: 0.7,
+    grid: ['#1e2f4a', '#14213a'],
+    sparkles: { color: '#e2e8f0', count: 220, size: 2.2, speed: 0.12, opacity: 0.5 },
+  },
+  {
+    id: 'matrix',
+    name: 'Matrix',
+    swatch: 'linear-gradient(135deg, #010401 0%, #14532d 130%)',
+    bg: '#010401',
+    floor: '#020a04',
+    ambient: 0.55,
+    grid: ['#0f3d1a', '#07230e'],
+    sparkles: { color: '#22c55e', count: 180, size: 1.4, speed: 0.5, opacity: 0.45 },
+  },
+  {
+    id: 'void',
+    name: 'Void',
+    swatch: 'linear-gradient(135deg, #000000 0%, #17181c 100%)',
+    bg: '#000000',
+    floor: '#050505',
+    ambient: 0.7,
+    grid: null,
+  },
+];
+
+export function getTheme(id) {
+  return THEMES.find((t) => t.id === id) || THEMES[0];
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# Frontend: frontend/src/components/ScenePanel.jsx
+# ---------------------------------------------------------------------------
+cat > frontend/src/components/ScenePanel.jsx <<'EOF'
+import Sheet from './Sheet';
+import { THEMES } from '../utils/themes';
+
+export default function ScenePanel({ current, onPick, onClose }) {
+  return (
+    <Sheet title="Scene background" onClose={onClose}>
+      <div className="grid grid-cols-2 gap-2">
+        {THEMES.map((theme) => (
+          <button
+            key={theme.id}
+            type="button"
+            onClick={() => onPick(theme.id)}
+            className={`relative h-16 overflow-hidden rounded-lg ring-2 transition-all ${
+              current === theme.id
+                ? 'ring-sky-400'
+                : 'ring-slate-700/60 hover:ring-slate-500'
+            }`}
+            style={{ background: theme.swatch }}
+          >
+            <span className="absolute bottom-1 left-2 text-[11px] font-medium text-slate-100 drop-shadow">
+              {theme.name}
+            </span>
+            {current === theme.id && (
+              <span className="absolute right-1.5 top-1 text-[11px] text-sky-300">✓</span>
+            )}
+          </button>
+        ))}
+      </div>
+      <p className="mt-2 text-[10px] text-slate-500">
+        Shared with everyone viewing this dashboard.
+      </p>
+    </Sheet>
+  );
+}
+EOF
+
+# ---------------------------------------------------------------------------
 # Frontend: frontend/src/components/DeviceChip.jsx
 # ---------------------------------------------------------------------------
 cat > frontend/src/components/DeviceChip.jsx <<'EOF'
@@ -1410,12 +1551,25 @@ EOF
 cat > frontend/src/components/Scene3D.jsx <<'EOF'
 import { Component } from 'react';
 import { Canvas } from '@react-three/fiber';
-import { OrbitControls, Sparkles } from '@react-three/drei';
+import { OrbitControls, Sparkles, Stars, Html } from '@react-three/drei';
 import { EffectComposer, Bloom } from '@react-three/postprocessing';
 import Room3D from './Room3D';
+import { getTheme } from '../utils/themes';
 
 const ROOM_SIZE = 4;
 const GAP = 1.4;
+const LEVEL_HEIGHT = 4.3;
+
+function levelLayout(count) {
+  const cols = Math.min(4, Math.max(2, Math.ceil(Math.sqrt(count || 1))));
+  const rows = Math.max(1, Math.ceil(count / cols));
+  return {
+    cols,
+    rows,
+    width: cols * ROOM_SIZE + (cols - 1) * GAP,
+    depth: rows * ROOM_SIZE + (rows - 1) * GAP,
+  };
+}
 
 // If WebGL can't start (old browser, blocked GPU), show a hint instead of
 // letting the whole app crash — the 2D edit-mode plan still works.
@@ -1450,23 +1604,24 @@ class WebGLBoundary extends Component {
  * bloom on active devices, floating dust, and an orbitable camera that slowly
  * auto-rotates until the user grabs it.
  */
-function Stage({ rooms, states, history, positions, onToggle, onOpenLight }) {
-  const cols = Math.min(4, Math.max(2, Math.ceil(Math.sqrt(rooms.length || 1))));
-  const rows = Math.max(1, Math.ceil(rooms.length / cols));
-  const width = cols * ROOM_SIZE + (cols - 1) * GAP;
-  const depth = rows * ROOM_SIZE + (rows - 1) * GAP;
-  const radius = Math.max(width, depth, ROOM_SIZE * 2);
+function Stage({ levels, theme, states, history, positions, onToggle, onOpenLight }) {
+  const layouts = levels.map((level) => levelLayout(level.rooms.length));
+  const width = Math.max(...layouts.map((l) => l.width));
+  const depth = Math.max(...layouts.map((l) => l.depth));
+  const height = (levels.length - 1) * LEVEL_HEIGHT;
+  const radius = Math.max(width, depth, height + ROOM_SIZE, ROOM_SIZE * 2);
+  const targetY = height / 2;
 
   return (
     <Canvas
       shadows
       dpr={[1, 2]}
-      camera={{ position: [radius * 0.95, radius * 0.9, radius * 0.95], fov: 38 }}
+      camera={{ position: [radius * 0.95, targetY + radius * 0.9, radius * 0.95], fov: 38 }}
       className="!absolute !inset-0"
     >
-      <color attach="background" args={['#020617']} />
-      <fog attach="fog" args={['#020617', radius * 2, radius * 4.5]} />
-      <ambientLight intensity={0.65} />
+      <color attach="background" args={[theme.bg]} />
+      <fog attach="fog" args={[theme.bg, radius * 2, radius * 4.5]} />
+      <ambientLight intensity={theme.ambient} />
       <directionalLight
         position={[radius * 0.8, radius * 1.4, radius * 0.6]}
         intensity={0.8}
@@ -1480,37 +1635,63 @@ function Stage({ rooms, states, history, positions, onToggle, onOpenLight }) {
         shadow-camera-near={0.5}
         shadow-camera-far={radius * 5}
       />
-      <gridHelper args={[radius * 5, 50, '#12203a', '#0a1424']} position={[0, -0.42, 0]} />
+      {theme.grid && (
+        <gridHelper args={[radius * 5, 50, theme.grid[0], theme.grid[1]]} position={[0, -0.42, 0]} />
+      )}
       <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.45, 0]} receiveShadow>
         <planeGeometry args={[radius * 8, radius * 8]} />
-        <meshStandardMaterial color="#040a16" roughness={1} />
+        <meshStandardMaterial color={theme.floor} roughness={1} />
       </mesh>
-      <Sparkles
-        count={140}
-        scale={[width * 1.8, 5, depth * 1.8]}
-        position={[0, 2, 0]}
-        size={1.6}
-        speed={0.25}
-        opacity={0.35}
-        color="#7dd3fc"
-      />
-      {rooms.map((room, i) => {
-        const col = i % cols;
-        const row = Math.floor(i / cols);
-        const x = (col - (cols - 1) / 2) * (ROOM_SIZE + GAP);
-        const z = (row - (rows - 1) / 2) * (ROOM_SIZE + GAP);
+      {theme.stars && (
+        <Stars radius={radius * 3} depth={radius} count={2500} factor={4} saturation={0} fade speed={0.6} />
+      )}
+      {theme.sparkles && (
+        <Sparkles
+          count={theme.sparkles.count}
+          scale={[width * 1.8, 5 + height, depth * 1.8]}
+          position={[0, 2 + height / 2, 0]}
+          size={theme.sparkles.size}
+          speed={theme.sparkles.speed}
+          opacity={theme.sparkles.opacity}
+          color={theme.sparkles.color}
+        />
+      )}
+      {levels.map((level, li) => {
+        const { cols, rows, width: levelWidth, depth: levelDepth } = layouts[li];
         return (
-          <Room3D
-            key={room.area_id}
-            room={room}
-            position={[x, 0, z]}
-            size={ROOM_SIZE}
-            states={states}
-            history={history}
-            positions={positions}
-            onToggle={onToggle}
-            onOpenLight={onOpenLight}
-          />
+          <group key={level.id} position-y={li * LEVEL_HEIGHT}>
+            {levels.length > 1 && level.name && (
+              <Html
+                position={[-levelWidth / 2 - 0.9, 0.7, levelDepth / 2]}
+                center
+                distanceFactor={14}
+                zIndexRange={[13, 0]}
+              >
+                <div className="pointer-events-none w-max rounded-md bg-slate-900/85 px-2 py-0.5 text-xs font-semibold uppercase tracking-wider text-slate-300 ring-1 ring-slate-700/60">
+                  {level.name}
+                </div>
+              </Html>
+            )}
+            {level.rooms.map((room, i) => {
+              const col = i % cols;
+              const row = Math.floor(i / cols);
+              const x = (col - (cols - 1) / 2) * (ROOM_SIZE + GAP);
+              const z = (row - (rows - 1) / 2) * (ROOM_SIZE + GAP);
+              return (
+                <Room3D
+                  key={room.area_id}
+                  room={room}
+                  position={[x, 0, z]}
+                  size={ROOM_SIZE}
+                  states={states}
+                  history={history}
+                  positions={positions}
+                  onToggle={onToggle}
+                  onOpenLight={onOpenLight}
+                />
+              );
+            })}
+          </group>
         );
       })}
       <EffectComposer>
@@ -1524,6 +1705,7 @@ function Stage({ rooms, states, history, positions, onToggle, onOpenLight }) {
         maxPolarAngle={1.32}
         minDistance={radius * 0.5}
         maxDistance={radius * 2.4}
+        target={[0, targetY, 0]}
         autoRotate
         autoRotateSpeed={0.35}
         onStart={(e) => {
@@ -1534,10 +1716,10 @@ function Stage({ rooms, states, history, positions, onToggle, onOpenLight }) {
   );
 }
 
-export default function Scene3D(props) {
+export default function Scene3D({ themeId, ...props }) {
   return (
     <WebGLBoundary>
-      <Stage {...props} />
+      <Stage theme={getTheme(themeId)} {...props} />
     </WebGLBoundary>
   );
 }
@@ -2039,13 +2221,14 @@ import LightPanel from './components/LightPanel';
 import DevicePanel from './components/DevicePanel';
 import RoomPanel from './components/RoomPanel';
 import HiddenPanel from './components/HiddenPanel';
+import ScenePanel from './components/ScenePanel';
 
 const LAYOUT_KEY = 'hearth3d-layout';
-const EMPTY_CONFIG = { devices: {}, rooms: {}, roomOrder: [], floors: [] };
+const EMPTY_CONFIG = { devices: {}, rooms: {}, roomOrder: [], floors: [], settings: {} };
 
 function normalizeConfig(raw) {
   if (!raw || typeof raw !== 'object') return { ...EMPTY_CONFIG };
-  if (!raw.devices && !raw.rooms && !raw.roomOrder && !raw.floors) {
+  if (!raw.devices && !raw.rooms && !raw.roomOrder && !raw.floors && !raw.settings) {
     // Legacy flat format: { entity_id: { x, y } }
     return { ...EMPTY_CONFIG, devices: raw };
   }
@@ -2054,6 +2237,7 @@ function normalizeConfig(raw) {
     rooms: raw.rooms || {},
     roomOrder: raw.roomOrder || [],
     floors: raw.floors || [],
+    settings: raw.settings || {},
   };
 }
 
@@ -2070,7 +2254,8 @@ function configHasData(c) {
     Object.keys(c.devices).length > 0 ||
     Object.keys(c.rooms).length > 0 ||
     c.roomOrder.length > 0 ||
-    c.floors.length > 0
+    c.floors.length > 0 ||
+    Object.keys(c.settings || {}).length > 0
   );
 }
 
@@ -2156,9 +2341,13 @@ export default function App() {
   const moveDevice = useCallback((entityId, pos) => setDeviceOverride(entityId, pos), [setDeviceOverride]);
 
   const resetConfig = () => {
-    if (!window.confirm('Reset all customizations (positions, renames, hidden items, floors)?')) return;
-    update(() => ({ devices: {}, rooms: {}, roomOrder: [], floors: [] }));
+    if (!window.confirm('Reset all customizations (positions, renames, hidden items, floors, background)?')) return;
+    update(() => ({ devices: {}, rooms: {}, roomOrder: [], floors: [], settings: {} }));
   };
+
+  const sceneThemeId = config.settings.background || 'midnight';
+  const setBackground = (id) =>
+    update((prev) => ({ ...prev, settings: { ...prev.settings, background: id } }));
 
   // ---- derived data ----
 
@@ -2222,6 +2411,22 @@ export default function App() {
       }),
     [orderedRooms, editMode, hasFloors, activeFloor]
   );
+
+  // Rooms grouped by floor for the 3D scene: "All floors" stacks each floor
+  // as its own storey; a specific floor renders as a single ground level.
+  const sceneLevels = useMemo(() => {
+    if (!hasFloors || activeFloor !== 'all') {
+      return [{ id: activeFloor || 'all', name: null, rooms: visibleRooms }];
+    }
+    const buckets = allFloors.map((floor) => ({
+      id: floor.id,
+      name: floor.name,
+      rooms: visibleRooms.filter((room) => room.floor_id === floor.id),
+    }));
+    const floorless = visibleRooms.filter((room) => !room.floor_id);
+    if (floorless.length > 0) buckets.push({ id: '_none', name: 'Other', rooms: floorless });
+    return buckets.filter((bucket) => bucket.rooms.length > 0);
+  }, [visibleRooms, allFloors, hasFloors, activeFloor]);
 
   const hiddenRooms = orderedRooms.filter((r) => r.hidden);
   const hiddenDevices = useMemo(() => {
@@ -2307,6 +2512,15 @@ export default function App() {
           </span>
         </div>
         <div className="flex items-center gap-2">
+          {!editMode && (
+            <button
+              type="button"
+              onClick={() => setSheet({ type: 'scene' })}
+              className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-800"
+            >
+              Scene
+            </button>
+          )}
           {editMode && (
             <>
               <button
@@ -2456,7 +2670,8 @@ export default function App() {
         ) : (
           <>
             <Scene3D
-              rooms={visibleRooms}
+              levels={sceneLevels}
+              themeId={sceneThemeId}
               states={states}
               history={history}
               positions={config.devices}
@@ -2515,6 +2730,9 @@ export default function App() {
           onShowDevice={(id) => setDeviceOverride(id, { hidden: false })}
           onClose={() => setSheet(null)}
         />
+      )}
+      {sheet && sheet.type === 'scene' && (
+        <ScenePanel current={sceneThemeId} onPick={setBackground} onClose={() => setSheet(null)} />
       )}
     </div>
   );
@@ -2671,6 +2889,12 @@ Browser ◄── WebSocket (port 8080) ──► Node.js backend ◄── HA W
 - **Orbit the home** — drag to rotate, scroll to zoom. The camera slowly
   auto-rotates until you grab it. (If WebGL is unavailable the app falls back
   to a notice; the 2D edit-mode plan always works.)
+- **Stacked storeys** — the *All floors* tab renders each floor as its own
+  level, stacked like a real multi-storey house with floor name plates.
+  Selecting a single floor lays it out flat.
+- **Scene backgrounds** — the **Scene** button in the header offers eight
+  backdrops (Midnight, Starfield, Synthwave, Aurora, Ember, Snowfall, Matrix,
+  Void). The choice is saved server-side and shared with every browser.
 - **Toggle a device** — click a light, switch, fan, media player, cover, or
   lock. Active devices glow in their domain color, and lit bulbs cast real
   light into their room.
