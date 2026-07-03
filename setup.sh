@@ -31,7 +31,8 @@ fi
 echo "Creating Hearth3D project in ./$PROJECT_DIR ..."
 mkdir -p "$PROJECT_DIR/server" \
          "$PROJECT_DIR/frontend/src/components" \
-         "$PROJECT_DIR/frontend/src/hooks"
+         "$PROJECT_DIR/frontend/src/hooks" \
+         "$PROJECT_DIR/frontend/src/utils"
 cd "$PROJECT_DIR"
 
 # ---------------------------------------------------------------------------
@@ -669,8 +670,12 @@ cat > frontend/package.json <<'EOF'
     "preview": "vite preview"
   },
   "dependencies": {
+    "@react-three/drei": "^9.114.3",
+    "@react-three/fiber": "^8.17.10",
+    "@react-three/postprocessing": "^2.16.3",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "three": "^0.169.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.2",
@@ -755,52 +760,21 @@ cat > frontend/src/index.css <<'EOF'
 @tailwind components;
 @tailwind utilities;
 
+html,
+body,
+#root {
+  height: 100%;
+}
+
 body {
   @apply bg-slate-950 text-slate-100 antialiased;
   background-image: radial-gradient(circle at 20% 0%, rgba(56, 189, 248, 0.06), transparent 40%),
     radial-gradient(circle at 80% 100%, rgba(251, 191, 36, 0.05), transparent 40%);
 }
 
-/*
- * Isometric projection. The plane is tilted and rotated; device chips are
- * counter-rotated ("billboarded") so their icons and labels stay upright and
- * readable. Edit mode removes the tilt entirely (.flat) so pointer-based
- * dragging maps 1:1 to card coordinates.
- */
-.iso-plane {
-  transform: rotateX(55deg) rotateZ(45deg);
-  transform-style: preserve-3d;
-  transition: transform 0.7s cubic-bezier(0.33, 1, 0.68, 1);
-}
-
-.iso-plane.flat {
-  transform: none;
-}
-
-.room-card,
-.device-node {
-  transform-style: preserve-3d;
-}
-
-.room-card {
-  transition: transform 0.35s ease, box-shadow 0.35s ease;
-}
-
-.iso-plane:not(.flat) .room-card:hover {
-  transform: translateZ(30px);
-}
-
-/*
- * translateZ lifts the billboard fully above the card plane before the
- * counter-rotation; without it the lower half of every chip sinks below the
- * semi-transparent card surface and renders dimmed.
- */
+/* Anchors a device chip to its saved position in the flat edit-mode plan.
+   The live view renders rooms in a real 3D scene (see Scene3D.jsx). */
 .device-billboard {
-  transform: translate(-50%, -50%) translateZ(48px) rotateZ(-45deg) rotateX(-55deg);
-  transition: transform 0.7s cubic-bezier(0.33, 1, 0.68, 1);
-}
-
-.flat .device-billboard {
   transform: translate(-50%, -50%);
 }
 EOF
@@ -1060,6 +1034,511 @@ export default function Sparkline({ points, className }) {
     <svg viewBox={`0 0 ${w} ${h}`} className={className} aria-hidden="true">
       <path d={d} fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
+  );
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# Frontend: frontend/src/utils/layout.js
+# ---------------------------------------------------------------------------
+cat > frontend/src/utils/layout.js <<'EOF'
+// Arranges devices without a saved position into a padded grid inside their
+// room. Alternate rows are offset (hex-style packing) so chips don't stack.
+// Coordinates are percentages of the room card / floor slab.
+export function defaultPos(index, count) {
+  const cols = Math.max(1, Math.ceil(Math.sqrt(count)));
+  const rows = Math.max(1, Math.ceil(count / cols));
+  const col = index % cols;
+  const row = Math.floor(index / cols);
+  return {
+    x: 12 + ((col + (row % 2 ? 0.65 : 0.35)) / cols) * 76,
+    y: 24 + ((row + 0.5) / rows) * 64,
+  };
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# Frontend: frontend/src/components/DeviceChip.jsx
+# ---------------------------------------------------------------------------
+cat > frontend/src/components/DeviceChip.jsx <<'EOF'
+import { useEffect, useRef, useState } from 'react';
+import Icon from './Icon';
+import Sparkline from './Sparkline';
+
+export const ACTIVE_STATES = [
+  'on',
+  'playing',
+  'open',
+  'opening',
+  'unlocked',
+  'heat',
+  'cool',
+  'heat_cool',
+  'auto',
+  'dry',
+  'fan_only',
+  'cleaning',
+];
+
+const TOGGLABLE_DOMAINS = ['light', 'switch', 'fan', 'media_player', 'cover', 'lock'];
+
+const ACTIVE_STYLES = {
+  light: 'bg-amber-400/25 text-amber-300 ring-amber-400/80 shadow-[0_0_26px_5px_rgba(251,191,36,0.5)]',
+  switch: 'bg-emerald-400/20 text-emerald-300 ring-emerald-400/70 shadow-[0_0_20px_2px_rgba(52,211,153,0.4)]',
+  media_player: 'bg-sky-400/20 text-sky-300 ring-sky-400/70 shadow-[0_0_20px_2px_rgba(56,189,248,0.4)]',
+  fan: 'bg-cyan-400/20 text-cyan-300 ring-cyan-400/70 shadow-[0_0_20px_2px_rgba(34,211,238,0.4)]',
+  cover: 'bg-violet-400/20 text-violet-300 ring-violet-400/70 shadow-[0_0_20px_2px_rgba(167,139,250,0.4)]',
+  lock: 'bg-red-400/20 text-red-300 ring-red-400/70 shadow-[0_0_20px_2px_rgba(248,113,113,0.4)]',
+  default: 'bg-emerald-400/20 text-emerald-300 ring-emerald-400/70 shadow-[0_0_20px_2px_rgba(52,211,153,0.4)]',
+};
+
+function CameraImage({ entityId }) {
+  const [tick, setTick] = useState(0);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    const timer = setInterval(() => setTick((v) => v + 1), 10000);
+    return () => clearInterval(timer);
+  }, []);
+
+  if (failed) {
+    return (
+      <span className="flex h-11 w-11 items-center justify-center">
+        <Icon domain="camera" className="h-5 w-5" />
+      </span>
+    );
+  }
+  return (
+    <img
+      src={`/api/camera/${entityId}?t=${tick}`}
+      onError={() => setFailed(true)}
+      alt=""
+      className="h-16 w-24 object-cover"
+      draggable="false"
+    />
+  );
+}
+
+/**
+ * The presentational device chip (icon or camera tile, label, detail line,
+ * sparkline) plus its interactions: click to toggle, long-press/right-click
+ * a light for its control panel, drag passthrough in edit mode. Shared by
+ * the flat edit-mode plan (DeviceNode) and the 3D scene (Device3D).
+ */
+export default function DeviceChip({
+  device,
+  state,
+  history,
+  editMode,
+  onDragStart,
+  onEditClick,
+  onToggle,
+  onOpenLight,
+}) {
+  const pressRef = useRef(null);
+  const stateStr = state ? state.state : 'unknown';
+  const isActive = ACTIVE_STATES.includes(stateStr);
+  const canToggle = TOGGLABLE_DOMAINS.includes(device.domain);
+
+  let detail = null;
+  if (device.domain === 'sensor' && state) {
+    const unit = state.attributes.unit_of_measurement;
+    detail = `${state.state}${unit ? ` ${unit}` : ''}`;
+  } else if (device.domain === 'climate' && state && state.attributes.current_temperature != null) {
+    detail = `${state.attributes.current_temperature}°`;
+  } else if (device.domain === 'media_player' && stateStr === 'playing' && state.attributes.media_title) {
+    detail = state.attributes.media_title;
+  } else if (device.domain === 'light' && isActive && state.attributes.brightness != null) {
+    detail = `${Math.round((state.attributes.brightness / 255) * 100)}%`;
+  }
+
+  const clearPress = () => {
+    if (pressRef.current && pressRef.current !== 'fired') {
+      clearTimeout(pressRef.current);
+      pressRef.current = null;
+    }
+  };
+
+  const handlePointerDown = (e) => {
+    if (editMode) {
+      if (onDragStart) onDragStart(e);
+      return;
+    }
+    if (device.domain === 'light') {
+      pressRef.current = setTimeout(() => {
+        pressRef.current = 'fired';
+        onOpenLight();
+      }, 500);
+    }
+  };
+
+  const handleClick = () => {
+    if (pressRef.current === 'fired') {
+      pressRef.current = null;
+      return;
+    }
+    clearPress();
+    if (editMode) {
+      onEditClick();
+      return;
+    }
+    if (canToggle) onToggle();
+  };
+
+  const handleContextMenu = (e) => {
+    if (!editMode && device.domain === 'light') {
+      e.preventDefault();
+      onOpenLight();
+    }
+  };
+
+  const isCamera = device.domain === 'camera';
+  const chipClass = isCamera
+    ? `overflow-hidden rounded-xl bg-slate-800/90 ring-1 ring-slate-600/70 transition-all duration-300 ${
+        editMode ? 'cursor-grab active:cursor-grabbing' : 'cursor-default'
+      }`
+    : `flex h-11 w-11 select-none items-center justify-center rounded-full ring-1 transition-all duration-300 ${
+        isActive
+          ? ACTIVE_STYLES[device.domain] || ACTIVE_STYLES.default
+          : 'bg-slate-800/90 text-slate-300 ring-slate-500/70'
+      } ${
+        editMode
+          ? 'cursor-grab active:cursor-grabbing'
+          : canToggle
+            ? 'cursor-pointer hover:scale-110'
+            : 'cursor-default'
+      }`;
+
+  return (
+    <div className="flex w-max max-w-[120px] flex-col items-center gap-1">
+      <button
+        type="button"
+        onPointerDown={handlePointerDown}
+        onPointerLeave={clearPress}
+        onClick={handleClick}
+        onContextMenu={handleContextMenu}
+        title={`${device.name} — ${stateStr}`}
+        className={chipClass}
+      >
+        {isCamera ? (
+          <CameraImage entityId={device.entity_id} />
+        ) : (
+          <Icon domain={device.domain} className="h-5 w-5" />
+        )}
+      </button>
+      <span className="pointer-events-none max-w-[96px] truncate rounded-md bg-slate-900/90 px-1.5 py-0.5 text-[11px] font-medium leading-tight text-slate-100 ring-1 ring-slate-700/60">
+        {device.name}
+      </span>
+      {detail && (
+        <span className="pointer-events-none max-w-[96px] truncate text-[10px] text-slate-300">
+          {detail}
+        </span>
+      )}
+      {device.domain === 'sensor' && history && history.length > 1 && (
+        <Sparkline points={history} className="pointer-events-none h-4 w-16 text-sky-400/80" />
+      )}
+    </div>
+  );
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# Frontend: frontend/src/components/Device3D.jsx
+# ---------------------------------------------------------------------------
+cat > frontend/src/components/Device3D.jsx <<'EOF'
+import { Html } from '@react-three/drei';
+import DeviceChip, { ACTIVE_STATES } from './DeviceChip';
+
+const DOMAIN_COLORS = {
+  light: '#fbbf24',
+  switch: '#34d399',
+  media_player: '#38bdf8',
+  fan: '#22d3ee',
+  cover: '#a78bfa',
+  lock: '#f87171',
+  default: '#34d399',
+};
+
+/**
+ * A device in the 3D scene: a pedestal puck, a glowing orb + floor light
+ * pool when active (lit lights cast a real point light so rooms visibly
+ * illuminate), and the interactive DOM chip floating above.
+ */
+export default function Device3D({ device, state, history, position, onToggle, onOpenLight }) {
+  const stateStr = state ? state.state : 'unknown';
+  const isActive = ACTIVE_STATES.includes(stateStr);
+  const isLight = device.domain === 'light';
+  let color = DOMAIN_COLORS[device.domain] || DOMAIN_COLORS.default;
+  if (isLight && state && state.attributes.rgb_color) {
+    color = `rgb(${state.attributes.rgb_color.map((v) => Math.round(v)).join(',')})`;
+  }
+  const brightness =
+    isLight && state && state.attributes.brightness != null ? state.attributes.brightness / 255 : 1;
+
+  return (
+    <group position={position}>
+      <mesh position={[0, 0.07, 0]} castShadow>
+        <cylinderGeometry args={[0.15, 0.19, 0.14, 24]} />
+        <meshStandardMaterial color="#2c3a52" roughness={0.55} metalness={0.35} />
+      </mesh>
+      {isActive && (
+        <>
+          <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.011, 0]}>
+            <circleGeometry args={[0.28 + (isLight ? brightness * 0.35 : 0), 32]} />
+            <meshBasicMaterial color={color} transparent opacity={0.22} depthWrite={false} />
+          </mesh>
+          <mesh position={[0, 0.22, 0]}>
+            <sphereGeometry args={[0.075, 16, 16]} />
+            <meshStandardMaterial color={color} emissive={color} emissiveIntensity={2.6} toneMapped={false} />
+          </mesh>
+        </>
+      )}
+      {isLight && isActive && (
+        <pointLight position={[0, 0.7, 0]} color={color} intensity={0.6 + brightness * 2} distance={3.4} decay={2} />
+      )}
+      <Html position={[0, 0.95, 0]} center distanceFactor={12} zIndexRange={[15, 0]}>
+        <DeviceChip
+          device={device}
+          state={state}
+          history={history}
+          editMode={false}
+          onToggle={onToggle}
+          onOpenLight={onOpenLight}
+          onEditClick={() => {}}
+        />
+      </Html>
+    </group>
+  );
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# Frontend: frontend/src/components/Room3D.jsx
+# ---------------------------------------------------------------------------
+cat > frontend/src/components/Room3D.jsx <<'EOF'
+import { useRef, useState } from 'react';
+import { useFrame } from '@react-three/fiber';
+import { RoundedBox, Html } from '@react-three/drei';
+import Device3D from './Device3D';
+import { defaultPos } from '../utils/layout';
+
+const WALL_HEIGHT = 1.15;
+const WALL_T = 0.12;
+const SLAB_T = 0.3;
+
+/**
+ * One room: a rounded floor slab with two low back walls, a floating name
+ * plate, and its devices. Hovering gently lifts the whole room.
+ */
+export default function Room3D({ room, position, size, states, history, positions, onToggle, onOpenLight }) {
+  const group = useRef();
+  const [hovered, setHovered] = useState(false);
+  const visibleDevices = room.devices.filter((d) => !d.hidden);
+  const lightsOn = visibleDevices.some((d) => {
+    const s = states[d.entity_id];
+    return d.domain === 'light' && s && s.state === 'on';
+  });
+
+  useFrame((_, dt) => {
+    if (!group.current) return;
+    const target = hovered ? 0.22 : 0;
+    group.current.position.y += (target - group.current.position.y) * Math.min(1, dt * 7);
+  });
+
+  return (
+    <group ref={group} position-x={position[0]} position-z={position[2]}>
+      <RoundedBox
+        args={[size, SLAB_T, size]}
+        radius={0.09}
+        position={[0, -SLAB_T / 2, 0]}
+        castShadow
+        receiveShadow
+        onPointerOver={(e) => {
+          e.stopPropagation();
+          setHovered(true);
+        }}
+        onPointerOut={() => setHovered(false)}
+      >
+        <meshStandardMaterial color={lightsOn ? '#1d2a45' : '#16203a'} roughness={0.85} metalness={0.15} />
+      </RoundedBox>
+      <mesh position={[0, WALL_HEIGHT / 2, -size / 2 + WALL_T / 2]} castShadow receiveShadow>
+        <boxGeometry args={[size, WALL_HEIGHT, WALL_T]} />
+        <meshStandardMaterial color="#283452" roughness={0.9} />
+      </mesh>
+      <mesh position={[-size / 2 + WALL_T / 2, WALL_HEIGHT / 2, 0]} castShadow receiveShadow>
+        <boxGeometry args={[WALL_T, WALL_HEIGHT, size]} />
+        <meshStandardMaterial color="#222d48" roughness={0.9} />
+      </mesh>
+      <Html
+        position={[-size / 2 + 0.35, WALL_HEIGHT + 0.18, -size / 2 + 0.35]}
+        center
+        distanceFactor={13}
+        zIndexRange={[14, 0]}
+      >
+        <div className="pointer-events-none w-max max-w-[160px] truncate rounded-md bg-slate-900/85 px-2 py-0.5 text-xs font-medium text-slate-100 ring-1 ring-slate-700/60">
+          {room.name}
+          <span className="ml-1.5 text-[10px] text-slate-400">{visibleDevices.length}</span>
+        </div>
+      </Html>
+      {visibleDevices.map((device, i) => {
+        const saved = positions[device.entity_id];
+        const p =
+          saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)
+            ? saved
+            : defaultPos(i, visibleDevices.length);
+        const inset = size * 0.84;
+        return (
+          <Device3D
+            key={device.entity_id}
+            device={device}
+            state={states[device.entity_id]}
+            history={history[device.entity_id]}
+            position={[(p.x / 100 - 0.5) * inset, 0, (p.y / 100 - 0.5) * inset]}
+            onToggle={() => onToggle(device.entity_id)}
+            onOpenLight={() => onOpenLight(device.entity_id)}
+          />
+        );
+      })}
+    </group>
+  );
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# Frontend: frontend/src/components/Scene3D.jsx
+# ---------------------------------------------------------------------------
+cat > frontend/src/components/Scene3D.jsx <<'EOF'
+import { Component } from 'react';
+import { Canvas } from '@react-three/fiber';
+import { OrbitControls, Sparkles } from '@react-three/drei';
+import { EffectComposer, Bloom } from '@react-three/postprocessing';
+import Room3D from './Room3D';
+
+const ROOM_SIZE = 4;
+const GAP = 1.4;
+
+// If WebGL can't start (old browser, blocked GPU), show a hint instead of
+// letting the whole app crash — the 2D edit-mode plan still works.
+class WebGLBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { failed: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  render() {
+    if (this.state.failed) {
+      return (
+        <div className="flex h-full items-center justify-center px-6 text-center text-slate-500">
+          <p className="text-sm">
+            The 3D view could not start (WebGL unavailable in this browser).
+            <br />
+            The 2D plan in <span className="text-slate-300">Edit layout</span> still works.
+          </p>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+/**
+ * The live 3D floor plan: rooms laid out on a dark stage with real lighting,
+ * bloom on active devices, floating dust, and an orbitable camera that slowly
+ * auto-rotates until the user grabs it.
+ */
+function Stage({ rooms, states, history, positions, onToggle, onOpenLight }) {
+  const cols = Math.min(4, Math.max(2, Math.ceil(Math.sqrt(rooms.length || 1))));
+  const rows = Math.max(1, Math.ceil(rooms.length / cols));
+  const width = cols * ROOM_SIZE + (cols - 1) * GAP;
+  const depth = rows * ROOM_SIZE + (rows - 1) * GAP;
+  const radius = Math.max(width, depth, ROOM_SIZE * 2);
+
+  return (
+    <Canvas
+      shadows
+      dpr={[1, 2]}
+      camera={{ position: [radius * 0.95, radius * 0.9, radius * 0.95], fov: 38 }}
+      className="!absolute !inset-0"
+    >
+      <color attach="background" args={['#020617']} />
+      <fog attach="fog" args={['#020617', radius * 2, radius * 4.5]} />
+      <ambientLight intensity={0.65} />
+      <directionalLight
+        position={[radius * 0.8, radius * 1.4, radius * 0.6]}
+        intensity={0.8}
+        castShadow
+        shadow-mapSize-width={2048}
+        shadow-mapSize-height={2048}
+        shadow-camera-left={-radius * 1.5}
+        shadow-camera-right={radius * 1.5}
+        shadow-camera-top={radius * 1.5}
+        shadow-camera-bottom={-radius * 1.5}
+        shadow-camera-near={0.5}
+        shadow-camera-far={radius * 5}
+      />
+      <gridHelper args={[radius * 5, 50, '#12203a', '#0a1424']} position={[0, -0.42, 0]} />
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.45, 0]} receiveShadow>
+        <planeGeometry args={[radius * 8, radius * 8]} />
+        <meshStandardMaterial color="#040a16" roughness={1} />
+      </mesh>
+      <Sparkles
+        count={140}
+        scale={[width * 1.8, 5, depth * 1.8]}
+        position={[0, 2, 0]}
+        size={1.6}
+        speed={0.25}
+        opacity={0.35}
+        color="#7dd3fc"
+      />
+      {rooms.map((room, i) => {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const x = (col - (cols - 1) / 2) * (ROOM_SIZE + GAP);
+        const z = (row - (rows - 1) / 2) * (ROOM_SIZE + GAP);
+        return (
+          <Room3D
+            key={room.area_id}
+            room={room}
+            position={[x, 0, z]}
+            size={ROOM_SIZE}
+            states={states}
+            history={history}
+            positions={positions}
+            onToggle={onToggle}
+            onOpenLight={onOpenLight}
+          />
+        );
+      })}
+      <EffectComposer>
+        <Bloom intensity={0.85} luminanceThreshold={0.4} luminanceSmoothing={0.25} mipmapBlur />
+      </EffectComposer>
+      <OrbitControls
+        enableDamping
+        dampingFactor={0.08}
+        enablePan={false}
+        minPolarAngle={0.35}
+        maxPolarAngle={1.32}
+        minDistance={radius * 0.5}
+        maxDistance={radius * 2.4}
+        autoRotate
+        autoRotateSpeed={0.35}
+        onStart={(e) => {
+          if (e && e.target) e.target.autoRotate = false;
+        }}
+      />
+    </Canvas>
+  );
+}
+
+export default function Scene3D(props) {
+  return (
+    <WebGLBoundary>
+      <Stage {...props} />
+    </WebGLBoundary>
   );
 }
 EOF
@@ -1367,64 +1846,12 @@ EOF
 # Frontend: frontend/src/components/DeviceNode.jsx
 # ---------------------------------------------------------------------------
 cat > frontend/src/components/DeviceNode.jsx <<'EOF'
-import { useEffect, useRef, useState } from 'react';
-import Icon from './Icon';
-import Sparkline from './Sparkline';
+import DeviceChip from './DeviceChip';
 
-const ACTIVE_STATES = [
-  'on',
-  'playing',
-  'open',
-  'opening',
-  'unlocked',
-  'heat',
-  'cool',
-  'heat_cool',
-  'auto',
-  'dry',
-  'fan_only',
-  'cleaning',
-];
-
-const TOGGLABLE_DOMAINS = ['light', 'switch', 'fan', 'media_player', 'cover', 'lock'];
-
-const ACTIVE_STYLES = {
-  light: 'bg-amber-400/25 text-amber-300 ring-amber-400/80 shadow-[0_0_26px_5px_rgba(251,191,36,0.5)]',
-  switch: 'bg-emerald-400/20 text-emerald-300 ring-emerald-400/70 shadow-[0_0_20px_2px_rgba(52,211,153,0.4)]',
-  media_player: 'bg-sky-400/20 text-sky-300 ring-sky-400/70 shadow-[0_0_20px_2px_rgba(56,189,248,0.4)]',
-  fan: 'bg-cyan-400/20 text-cyan-300 ring-cyan-400/70 shadow-[0_0_20px_2px_rgba(34,211,238,0.4)]',
-  cover: 'bg-violet-400/20 text-violet-300 ring-violet-400/70 shadow-[0_0_20px_2px_rgba(167,139,250,0.4)]',
-  lock: 'bg-red-400/20 text-red-300 ring-red-400/70 shadow-[0_0_20px_2px_rgba(248,113,113,0.4)]',
-  default: 'bg-emerald-400/20 text-emerald-300 ring-emerald-400/70 shadow-[0_0_20px_2px_rgba(52,211,153,0.4)]',
-};
-
-function CameraImage({ entityId }) {
-  const [tick, setTick] = useState(0);
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    const timer = setInterval(() => setTick((v) => v + 1), 10000);
-    return () => clearInterval(timer);
-  }, []);
-
-  if (failed) {
-    return (
-      <span className="flex h-11 w-11 items-center justify-center">
-        <Icon domain="camera" className="h-5 w-5" />
-      </span>
-    );
-  }
-  return (
-    <img
-      src={`/api/camera/${entityId}?t=${tick}`}
-      onError={() => setFailed(true)}
-      alt=""
-      className="h-16 w-24 object-cover"
-      draggable="false"
-    />
-  );
-}
-
+/**
+ * Positions a DeviceChip on the flat edit-mode room card at its saved
+ * (or default) percentage coordinates. The live view uses Device3D instead.
+ */
 export default function DeviceNode({
   device,
   state,
@@ -1436,109 +1863,19 @@ export default function DeviceNode({
   onToggle,
   onOpenLight,
 }) {
-  const pressRef = useRef(null);
-  const stateStr = state ? state.state : 'unknown';
-  const isActive = ACTIVE_STATES.includes(stateStr);
-  const canToggle = TOGGLABLE_DOMAINS.includes(device.domain);
-
-  let detail = null;
-  if (device.domain === 'sensor' && state) {
-    const unit = state.attributes.unit_of_measurement;
-    detail = `${state.state}${unit ? ` ${unit}` : ''}`;
-  } else if (device.domain === 'climate' && state && state.attributes.current_temperature != null) {
-    detail = `${state.attributes.current_temperature}°`;
-  } else if (device.domain === 'media_player' && stateStr === 'playing' && state.attributes.media_title) {
-    detail = state.attributes.media_title;
-  } else if (device.domain === 'light' && isActive && state.attributes.brightness != null) {
-    detail = `${Math.round((state.attributes.brightness / 255) * 100)}%`;
-  }
-
-  const clearPress = () => {
-    if (pressRef.current && pressRef.current !== 'fired') {
-      clearTimeout(pressRef.current);
-      pressRef.current = null;
-    }
-  };
-
-  const handlePointerDown = (e) => {
-    if (editMode) {
-      onDragStart(e);
-      return;
-    }
-    if (device.domain === 'light') {
-      pressRef.current = setTimeout(() => {
-        pressRef.current = 'fired';
-        onOpenLight();
-      }, 500);
-    }
-  };
-
-  const handleClick = () => {
-    if (pressRef.current === 'fired') {
-      pressRef.current = null;
-      return;
-    }
-    clearPress();
-    if (editMode) {
-      onEditClick();
-      return;
-    }
-    if (canToggle) onToggle();
-  };
-
-  const handleContextMenu = (e) => {
-    if (!editMode && device.domain === 'light') {
-      e.preventDefault();
-      onOpenLight();
-    }
-  };
-
-  const isCamera = device.domain === 'camera';
-  const chipClass = isCamera
-    ? `overflow-hidden rounded-xl bg-slate-800/90 ring-1 ring-slate-600/70 transition-all duration-300 ${
-        editMode ? 'cursor-grab active:cursor-grabbing' : 'cursor-default'
-      }`
-    : `flex h-11 w-11 select-none items-center justify-center rounded-full ring-1 transition-all duration-300 ${
-        isActive
-          ? ACTIVE_STYLES[device.domain] || ACTIVE_STYLES.default
-          : 'bg-slate-800/90 text-slate-300 ring-slate-500/70'
-      } ${
-        editMode
-          ? 'cursor-grab active:cursor-grabbing'
-          : canToggle
-            ? 'cursor-pointer hover:scale-110'
-            : 'cursor-default'
-      }`;
-
   return (
     <div className="device-node absolute z-10" style={{ left: `${pos.x}%`, top: `${pos.y}%` }}>
-      <div className="device-billboard flex w-max max-w-[120px] flex-col items-center gap-1">
-        <button
-          type="button"
-          onPointerDown={handlePointerDown}
-          onPointerLeave={clearPress}
-          onClick={handleClick}
-          onContextMenu={handleContextMenu}
-          title={`${device.name} — ${stateStr}`}
-          className={chipClass}
-        >
-          {isCamera ? (
-            <CameraImage entityId={device.entity_id} />
-          ) : (
-            <Icon domain={device.domain} className="h-5 w-5" />
-          )}
-        </button>
-        <span className="pointer-events-none max-w-[96px] truncate rounded-md bg-slate-900/90 px-1.5 py-0.5 text-[11px] font-medium leading-tight text-slate-100 ring-1 ring-slate-700/60">
-          {device.name}
-        </span>
-        {detail && (
-          <span className="pointer-events-none max-w-[96px] truncate text-[10px] text-slate-300">
-            {detail}
-          </span>
-        )}
-        {device.domain === 'sensor' && history && history.length > 1 && (
-          <Sparkline points={history} className="pointer-events-none h-4 w-16 text-sky-400/80" />
-        )}
+      <div className="device-billboard">
+        <DeviceChip
+          device={device}
+          state={state}
+          history={history}
+          editMode={editMode}
+          onDragStart={onDragStart}
+          onEditClick={onEditClick}
+          onToggle={onToggle}
+          onOpenLight={onOpenLight}
+        />
       </div>
     </div>
   );
@@ -1551,20 +1888,7 @@ EOF
 cat > frontend/src/components/RoomCard.jsx <<'EOF'
 import { useRef } from 'react';
 import DeviceNode from './DeviceNode';
-
-// Arranges devices without a saved position into a padded grid inside the
-// card. Alternate rows are offset (hex-style packing) so billboarded chips
-// don't stack vertically once the isometric tilt compresses the card.
-function defaultPos(index, count) {
-  const cols = Math.max(1, Math.ceil(Math.sqrt(count)));
-  const rows = Math.max(1, Math.ceil(count / cols));
-  const col = index % cols;
-  const row = Math.floor(index / cols);
-  return {
-    x: 12 + ((col + (row % 2 ? 0.65 : 0.35)) / cols) * 76,
-    y: 24 + ((row + 0.5) / rows) * 64,
-  };
-}
+import { defaultPos } from '../utils/layout';
 
 const ACTIVE_STATES = ['on', 'playing', 'open', 'unlocked'];
 
@@ -1710,6 +2034,7 @@ cat > frontend/src/App.jsx <<'EOF'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import useHearthSocket from './hooks/useHearthSocket';
 import RoomCard from './components/RoomCard';
+import Scene3D from './components/Scene3D';
 import LightPanel from './components/LightPanel';
 import DevicePanel from './components/DevicePanel';
 import RoomPanel from './components/RoomPanel';
@@ -1961,11 +2286,11 @@ export default function App() {
     ...(hasFloorless && hasFloors ? [{ id: '_none', name: 'Other', custom: false }] : []),
   ];
 
-  // Roughly square arrangement reads best under the isometric projection.
+  // Column count for the flat edit-mode plan (roughly square reads best).
   const gridCols = Math.min(4, Math.max(2, Math.ceil(Math.sqrt(visibleRooms.length || 1))));
 
   return (
-    <div className="flex min-h-screen flex-col">
+    <div className="flex h-screen flex-col">
       <header className="sticky top-0 z-20 flex items-center justify-between border-b border-slate-800/80 bg-slate-950/80 px-6 py-4 backdrop-blur">
         <div className="flex items-center gap-3">
           <span className="text-2xl">🏠</span>
@@ -2089,41 +2414,59 @@ export default function App() {
         </div>
       )}
 
-      <main className="flex flex-1 items-center justify-center px-6 py-16">
+      <main className={`relative flex-1 ${editMode ? 'overflow-y-auto' : 'overflow-hidden'}`}>
         {visibleRooms.length === 0 ? (
-          <div className="self-center text-center text-slate-500">
-            <div className="mb-3 animate-pulse text-4xl">🏠</div>
-            <p className="text-sm">
-              {haConnected
-                ? 'No rooms to show. Assign devices to areas in Home Assistant, or check the Hidden panel in edit mode.'
-                : 'Waiting for room and device topology…'}
-            </p>
+          <div className="flex h-full items-center justify-center px-6 text-center text-slate-500">
+            <div>
+              <div className="mb-3 animate-pulse text-4xl">🏠</div>
+              <p className="text-sm">
+                {haConnected
+                  ? 'No rooms to show. Assign devices to areas in Home Assistant, or check the Hidden panel in edit mode.'
+                  : 'Waiting for room and device topology…'}
+              </p>
+            </div>
+          </div>
+        ) : editMode ? (
+          <div className="flex justify-center px-6 py-10">
+            <div
+              className="grid w-full gap-8"
+              style={{
+                gridTemplateColumns: `repeat(${gridCols}, minmax(0, 1fr))`,
+                maxWidth: `min(92vw, ${gridCols * 420}px)`,
+              }}
+            >
+              {visibleRooms.map((room) => (
+                <RoomCard
+                  key={room.area_id}
+                  room={room}
+                  states={states}
+                  history={history}
+                  positions={config.devices}
+                  editMode={editMode}
+                  onMove={moveDevice}
+                  onToggle={toggle}
+                  onOpenLight={(id) => setSheet({ type: 'light', id })}
+                  onOpenDeviceSettings={(id) => setSheet({ type: 'device', id })}
+                  onOpenRoomSettings={(id) => setSheet({ type: 'room', id })}
+                  onReorder={reorderRoom}
+                />
+              ))}
+            </div>
           </div>
         ) : (
-          <div
-            className={`iso-plane ${editMode ? 'flat' : ''} grid w-full gap-8`}
-            style={{
-              gridTemplateColumns: `repeat(${gridCols}, minmax(0, 1fr))`,
-              maxWidth: `min(92vw, ${gridCols * 420}px)`,
-            }}
-          >
-            {visibleRooms.map((room) => (
-              <RoomCard
-                key={room.area_id}
-                room={room}
-                states={states}
-                history={history}
-                positions={config.devices}
-                editMode={editMode}
-                onMove={moveDevice}
-                onToggle={toggle}
-                onOpenLight={(id) => setSheet({ type: 'light', id })}
-                onOpenDeviceSettings={(id) => setSheet({ type: 'device', id })}
-                onOpenRoomSettings={(id) => setSheet({ type: 'room', id })}
-                onReorder={reorderRoom}
-              />
-            ))}
-          </div>
+          <>
+            <Scene3D
+              rooms={visibleRooms}
+              states={states}
+              history={history}
+              positions={config.devices}
+              onToggle={toggle}
+              onOpenLight={(id) => setSheet({ type: 'light', id })}
+            />
+            <div className="pointer-events-none absolute bottom-3 right-4 z-10 text-[11px] text-slate-500">
+              Drag to orbit · scroll to zoom · click a device to toggle · hold a light for controls
+            </div>
+          </>
         )}
       </main>
 
@@ -2279,10 +2622,11 @@ EOF
 cat > README.md <<'EOF'
 # Hearth3D
 
-A self-contained, real-time isometric dashboard for Home Assistant. Rooms are
-discovered automatically from your Home Assistant areas; devices appear on
-each room card based on their area assignment, update live, and can be
-controlled with a click. Everything about the view — positions, names, rooms,
+A self-contained, real-time 3D dashboard for Home Assistant. Rooms are
+discovered automatically from your Home Assistant areas and rendered as a
+live Three.js scene — orbit the camera, watch lit bulbs cast real light into
+their rooms — with devices placed by area assignment, updating live, and
+controllable with a click. Everything about the view — positions, names, rooms,
 floors, visibility — can be customized in edit mode, and the customization is
 stored server-side so every browser sees the same dashboard.
 
@@ -2324,8 +2668,12 @@ Browser ◄── WebSocket (port 8080) ──► Node.js backend ◄── HA W
 
 ### Everyday control
 
+- **Orbit the home** — drag to rotate, scroll to zoom. The camera slowly
+  auto-rotates until you grab it. (If WebGL is unavailable the app falls back
+  to a notice; the 2D edit-mode plan always works.)
 - **Toggle a device** — click a light, switch, fan, media player, cover, or
-  lock. Active devices glow in their domain color.
+  lock. Active devices glow in their domain color, and lit bulbs cast real
+  light into their room.
 - **Dim / recolor a light** — long-press (or right-click) a light to open its
   control panel with a brightness slider and color picker.
 - **Floors** — if your Home Assistant areas are assigned to floors (or you
