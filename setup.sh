@@ -3,10 +3,14 @@
 # setup.sh — scaffolds the complete Hearth3D project.
 #
 # Hearth3D is a self-contained, Dockerized dashboard for Home Assistant:
-#   * Node.js backend that mirrors the HA area/device/entity registries and
-#     streams live state changes to the browser over WebSocket.
+#   * Node.js backend that mirrors the HA area/device/entity/floor registries
+#     and streams live state changes to the browser over WebSocket.
 #   * React + Tailwind frontend rendering a dark-mode isometric floor plan,
-#     with click-to-toggle devices and a drag-to-arrange edit mode.
+#     with click-to-toggle devices, light brightness/color controls, camera
+#     tiles, sensor sparklines, floor tabs, and a full customization edit
+#     mode (rename/move/hide devices, rename rooms, assign floors, reorder).
+#   * Layout & customization persist server-side on a Docker volume and are
+#     shared by every browser.
 #   * Multi-stage Dockerfile + docker-compose.yml (port 8080).
 #
 # Usage:
@@ -37,7 +41,7 @@ cat > server/package.json <<'EOF'
 {
   "name": "hearth3d-server",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Hearth3D backend: Home Assistant bridge and static frontend host",
   "main": "server.js",
   "scripts": {
@@ -58,11 +62,15 @@ cat > server/server.js <<'EOF'
 /**
  * Hearth3D backend.
  *
- * Connects to the Home Assistant WebSocket API, mirrors the area/device/entity
- * registries into a room -> devices topology, streams state changes to browser
- * clients over a local WebSocket (path /ws on the same port), and relays
- * toggle commands back to Home Assistant. Also serves the built React
- * frontend from ./public.
+ * Connects to the Home Assistant WebSocket API, mirrors the
+ * area/device/entity/floor registries into a room -> devices topology,
+ * streams state changes to browser clients over a local WebSocket (path /ws
+ * on the same port), relays toggle / light commands back to Home Assistant,
+ * proxies camera snapshots, and persists the shared dashboard customization
+ * (positions, renames, hidden items, floors, room order) to DATA_DIR.
+ *
+ * Runs standalone (HA_URL + HA_TOKEN) or inside a Home Assistant add-on
+ * sandbox (SUPERVISOR_TOKEN, no HA_URL needed).
  */
 
 const http = require('http');
@@ -70,21 +78,28 @@ const fs = require('fs');
 const path = require('path');
 const WebSocket = require('ws');
 
-const HA_URL = (process.env.HA_URL || 'http://homeassistant.local:8123').replace(/\/+$/, '');
-const HA_TOKEN = process.env.HA_TOKEN || '';
+const RAW_HA_URL = (process.env.HA_URL || '').replace(/\/+$/, '');
+const SUPERVISOR_TOKEN = process.env.SUPERVISOR_TOKEN || '';
+const IS_ADDON = !RAW_HA_URL && !!SUPERVISOR_TOKEN;
+const HA_URL = RAW_HA_URL || 'http://homeassistant.local:8123';
+const TOKEN = process.env.HA_TOKEN || SUPERVISOR_TOKEN;
+const WS_URL = IS_ADDON ? 'ws://supervisor/core/websocket' : HA_URL.replace(/^http/, 'ws') + '/api/websocket';
+const REST_BASE = IS_ADDON ? 'http://supervisor/core/api' : `${HA_URL}/api`;
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const LAYOUT_FILE = path.join(DATA_DIR, 'layout.json');
 
 // Entity domains shown on the dashboard. Override with e.g.
 // DOMAINS=light,switch,sensor in the environment.
-const DISPLAY_DOMAINS = (process.env.DOMAINS || 'light,switch,media_player,fan,cover,lock,climate,vacuum')
+const DISPLAY_DOMAINS = (process.env.DOMAINS || 'light,switch,media_player,fan,cover,lock,climate,vacuum,camera')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
 
-if (!HA_TOKEN) {
-  console.error('[hearth3d] FATAL: HA_TOKEN is not set. Create a long-lived access token in');
-  console.error('[hearth3d] Home Assistant (Profile -> Security) and set it in your .env file.');
+if (!TOKEN) {
+  console.error('[hearth3d] FATAL: no credentials. Set HA_TOKEN (create a long-lived access');
+  console.error('[hearth3d] token in Home Assistant: Profile -> Security) in your .env file.');
   process.exit(1);
 }
 
@@ -92,11 +107,79 @@ if (!HA_TOKEN) {
 // Shared state
 // ---------------------------------------------------------------------------
 
-const registry = { areas: [], devices: [], entities: [] };
+const registry = { areas: [], devices: [], entities: [], floors: [] };
 const states = new Map(); // entity_id -> { state, attributes, last_changed }
-let topology = []; // [{ area_id, name, devices: [{ entity_id, domain, name }] }]
+const history = new Map(); // sensor entity_id -> [{ t, v }] (last 60 points)
+let topology = []; // [{ area_id, name, floor_id, devices: [{ entity_id, domain, name }] }]
 let displayedEntities = new Set();
 let registryRefreshTimer = null;
+
+// Dashboard customization, persisted to disk and shared by all browsers:
+// { devices: { id: { x, y, room, hidden, name } },
+//   rooms:   { id: { hidden, floor, name } },
+//   roomOrder: [area_id], floors: [{ id, name }] }
+let layout = { devices: {}, rooms: {}, roomOrder: [], floors: [] };
+let layoutSaveTimer = null;
+
+try {
+  layout = sanitizeLayout(JSON.parse(fs.readFileSync(LAYOUT_FILE, 'utf8')));
+  console.log(`[hearth3d] Loaded saved layout from ${LAYOUT_FILE}`);
+} catch {
+  // First run or unreadable file — start with the empty layout.
+}
+
+function sanitizeLayout(input) {
+  const out = { devices: {}, rooms: {}, roomOrder: [], floors: [] };
+  if (!input || typeof input !== 'object') return out;
+  const str = (v, max = 80) => (typeof v === 'string' && v.length > 0 ? v.slice(0, max) : undefined);
+  if (input.devices && typeof input.devices === 'object') {
+    for (const [id, o] of Object.entries(input.devices)) {
+      if (!o || typeof o !== 'object') continue;
+      const d = {};
+      if (Number.isFinite(o.x)) d.x = Math.min(100, Math.max(0, o.x));
+      if (Number.isFinite(o.y)) d.y = Math.min(100, Math.max(0, o.y));
+      if (str(o.room, 120)) d.room = str(o.room, 120);
+      if (o.hidden === true) d.hidden = true;
+      if (str(o.name)) d.name = str(o.name);
+      if (Object.keys(d).length > 0) out.devices[id.slice(0, 120)] = d;
+    }
+  }
+  if (input.rooms && typeof input.rooms === 'object') {
+    for (const [id, o] of Object.entries(input.rooms)) {
+      if (!o || typeof o !== 'object') continue;
+      const r = {};
+      if (o.hidden === true) r.hidden = true;
+      if (str(o.floor, 120)) r.floor = str(o.floor, 120);
+      if (str(o.name)) r.name = str(o.name);
+      if (Object.keys(r).length > 0) out.rooms[id.slice(0, 120)] = r;
+    }
+  }
+  if (Array.isArray(input.roomOrder)) {
+    out.roomOrder = input.roomOrder
+      .filter((v) => typeof v === 'string')
+      .map((v) => v.slice(0, 120))
+      .slice(0, 500);
+  }
+  if (Array.isArray(input.floors)) {
+    out.floors = input.floors
+      .filter((f) => f && typeof f === 'object' && typeof f.id === 'string' && typeof f.name === 'string')
+      .map((f) => ({ id: f.id.slice(0, 60), name: f.name.slice(0, 60) }))
+      .slice(0, 50);
+  }
+  return out;
+}
+
+function saveLayoutSoon() {
+  clearTimeout(layoutSaveTimer);
+  layoutSaveTimer = setTimeout(() => {
+    fs.mkdir(DATA_DIR, { recursive: true }, (dirErr) => {
+      if (dirErr) return console.error(`[hearth3d] Cannot create ${DATA_DIR}: ${dirErr.message}`);
+      fs.writeFile(LAYOUT_FILE, JSON.stringify(layout), (err) => {
+        if (err) console.error(`[hearth3d] Failed to save layout: ${err.message}`);
+      });
+    });
+  }, 500);
+}
 
 function pickState(s) {
   const a = s.attributes || {};
@@ -116,13 +199,28 @@ function pickState(s) {
   };
 }
 
+function recordHistory(entityId, stateStr, lastChanged) {
+  if (!entityId.startsWith('sensor.')) return;
+  const value = parseFloat(stateStr);
+  if (!Number.isFinite(value)) return;
+  const points = history.get(entityId) || [];
+  points.push({ t: Date.parse(lastChanged) || Date.now(), v: value });
+  if (points.length > 60) points.shift();
+  history.set(entityId, points);
+}
+
 function rebuildTopology() {
   const deviceById = new Map(registry.devices.map((d) => [d.id, d]));
   const rooms = new Map();
   for (const area of registry.areas) {
-    rooms.set(area.area_id, { area_id: area.area_id, name: area.name, devices: [] });
+    rooms.set(area.area_id, {
+      area_id: area.area_id,
+      name: area.name,
+      floor_id: area.floor_id || null,
+      devices: [],
+    });
   }
-  const unassigned = { area_id: '_unassigned', name: 'Unassigned', devices: [] };
+  const unassigned = { area_id: '_unassigned', name: 'Unassigned', floor_id: null, devices: [] };
 
   for (const entity of registry.entities) {
     if (entity.disabled_by || entity.hidden_by) continue;
@@ -151,19 +249,25 @@ function rebuildTopology() {
 
   if (unassigned.devices.length > 0) rooms.set(unassigned.area_id, unassigned);
 
-  topology = [...rooms.values()]
-    .filter((room) => room.devices.length > 0)
-    .sort((a, b) => a.name.localeCompare(b.name));
+  // Empty rooms are included so users can move devices into them; the
+  // frontend hides them outside edit mode.
+  topology = [...rooms.values()].sort((a, b) => a.name.localeCompare(b.name));
   displayedEntities = new Set(topology.flatMap((room) => room.devices.map((d) => d.entity_id)));
 }
 
 function topologyMessage() {
   const visibleStates = {};
+  const visibleHistory = {};
   for (const entityId of displayedEntities) {
     const s = states.get(entityId);
     if (s) visibleStates[entityId] = s;
+    const h = history.get(entityId);
+    if (h && h.length > 0) visibleHistory[entityId] = h;
   }
-  return { type: 'topology', rooms: topology, states: visibleStates };
+  const floors = registry.floors
+    .map((f) => ({ floor_id: f.floor_id, name: f.name, level: f.level ?? 0 }))
+    .sort((a, b) => a.level - b.level);
+  return { type: 'topology', rooms: topology, floors, states: visibleStates, history: visibleHistory };
 }
 
 // ---------------------------------------------------------------------------
@@ -171,8 +275,8 @@ function topologyMessage() {
 // ---------------------------------------------------------------------------
 
 class HomeAssistant {
-  constructor(baseUrl, token) {
-    this.wsUrl = baseUrl.replace(/^http/, 'ws') + '/api/websocket';
+  constructor(wsUrl, token) {
+    this.wsUrl = wsUrl;
     this.token = token;
     this.ws = null;
     this.msgId = 0;
@@ -264,18 +368,29 @@ class HomeAssistant {
     }
   }
 
-  async bootstrap() {
-    const [areas, devices, entities, allStates] = await Promise.all([
+  async fetchRegistries() {
+    const [areas, devices, entities] = await Promise.all([
       this.send({ type: 'config/area_registry/list' }),
       this.send({ type: 'config/device_registry/list' }),
       this.send({ type: 'config/entity_registry/list' }),
-      this.send({ type: 'get_states' }),
     ]);
+    // Floor registry requires HA 2024.4+; tolerate its absence.
+    const floors = await this.send({ type: 'config/floor_registry/list' }).catch(() => []);
     registry.areas = areas;
     registry.devices = devices;
     registry.entities = entities;
+    registry.floors = Array.isArray(floors) ? floors : [];
+  }
+
+  async bootstrap() {
+    await this.fetchRegistries();
+    const allStates = await this.send({ type: 'get_states' });
     states.clear();
-    for (const s of allStates) states.set(s.entity_id, pickState(s));
+    history.clear();
+    for (const s of allStates) {
+      states.set(s.entity_id, pickState(s));
+      recordHistory(s.entity_id, s.state, s.last_changed);
+    }
     rebuildTopology();
 
     await this.send({ type: 'subscribe_events', event_type: 'state_changed' });
@@ -283,26 +398,20 @@ class HomeAssistant {
       'area_registry_updated',
       'device_registry_updated',
       'entity_registry_updated',
+      'floor_registry_updated',
     ]) {
-      await this.send({ type: 'subscribe_events', event_type: eventType });
+      await this.send({ type: 'subscribe_events', event_type: eventType }).catch(() => {});
     }
 
     console.log(
-      `[hearth3d] Topology ready: ${topology.length} rooms, ${displayedEntities.size} devices`
+      `[hearth3d] Topology ready: ${topology.length} rooms, ${registry.floors.length} floors, ${displayedEntities.size} devices`
     );
     broadcast({ type: 'ha_status', connected: true });
     broadcast(topologyMessage());
   }
 
   async refreshRegistries() {
-    const [areas, devices, entities] = await Promise.all([
-      this.send({ type: 'config/area_registry/list' }),
-      this.send({ type: 'config/device_registry/list' }),
-      this.send({ type: 'config/entity_registry/list' }),
-    ]);
-    registry.areas = areas;
-    registry.devices = devices;
-    registry.entities = entities;
+    await this.fetchRegistries();
     rebuildTopology();
     broadcast(topologyMessage());
     console.log(`[hearth3d] Registries refreshed: ${topology.length} rooms`);
@@ -331,6 +440,7 @@ function handleHaEvent(event) {
     }
     const s = pickState(newState);
     states.set(entityId, s);
+    recordHistory(entityId, newState.state, newState.last_changed);
     if (displayedEntities.has(entityId)) {
       broadcast({ type: 'state', entity_id: entityId, ...s });
     }
@@ -346,7 +456,7 @@ function handleHaEvent(event) {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP server (static frontend + health) and browser-facing WebSocket
+// HTTP server (static frontend + health + camera proxy) and browser WebSocket
 // ---------------------------------------------------------------------------
 
 const MIME_TYPES = {
@@ -374,6 +484,33 @@ function handleHttp(req, res) {
         devices: displayedEntities.size,
       })
     );
+    return;
+  }
+
+  // Camera snapshot proxy — the token never reaches the browser.
+  if (pathname.startsWith('/api/camera/')) {
+    const entityId = decodeURIComponent(pathname.slice('/api/camera/'.length));
+    if (!entityId.startsWith('camera.') || !displayedEntities.has(entityId)) {
+      res.writeHead(404);
+      res.end('Unknown camera');
+      return;
+    }
+    fetch(`${REST_BASE}/camera_proxy/${entityId}`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    })
+      .then((upstream) => {
+        if (!upstream.ok) throw new Error(`upstream ${upstream.status}`);
+        res.writeHead(200, {
+          'Content-Type': upstream.headers.get('content-type') || 'image/jpeg',
+          'Cache-Control': 'no-store',
+        });
+        return upstream.arrayBuffer();
+      })
+      .then((buf) => res.end(Buffer.from(buf)))
+      .catch((err) => {
+        res.writeHead(502);
+        res.end(`Camera proxy failed: ${err.message}`);
+      });
     return;
   }
 
@@ -421,6 +558,7 @@ function broadcast(message) {
 
 wss.on('connection', (client) => {
   client.send(JSON.stringify({ type: 'ha_status', connected: ha.connected }));
+  client.send(JSON.stringify({ type: 'layout', layout }));
   if (topology.length > 0) client.send(JSON.stringify(topologyMessage()));
 
   client.on('message', (raw) => {
@@ -430,33 +568,82 @@ wss.on('connection', (client) => {
     } catch {
       return;
     }
-    handleClientMessage(msg);
+    handleClientMessage(client, msg);
   });
 });
 
-function handleClientMessage(msg) {
-  if (msg.type !== 'toggle' || typeof msg.entity_id !== 'string') return;
-  // Only allow commands for entities we actually expose on the dashboard.
-  if (!displayedEntities.has(msg.entity_id)) return;
-
-  const domain = msg.entity_id.split('.')[0];
-  let serviceDomain = 'homeassistant';
-  let service = 'toggle';
-  if (domain === 'lock') {
-    const current = states.get(msg.entity_id);
-    serviceDomain = 'lock';
-    service = current && current.state === 'locked' ? 'unlock' : 'lock';
-  }
-
-  ha.send({
-    type: 'call_service',
-    domain: serviceDomain,
-    service,
-    target: { entity_id: msg.entity_id },
-  }).catch((err) => console.error(`[hearth3d] call_service failed: ${err.message}`));
+function logServiceError(err) {
+  console.error(`[hearth3d] call_service failed: ${err.message}`);
 }
 
-const ha = new HomeAssistant(HA_URL, HA_TOKEN);
+function handleClientMessage(sender, msg) {
+  switch (msg.type) {
+    case 'toggle': {
+      if (typeof msg.entity_id !== 'string' || !displayedEntities.has(msg.entity_id)) return;
+      const domain = msg.entity_id.split('.')[0];
+      let serviceDomain = 'homeassistant';
+      let service = 'toggle';
+      if (domain === 'lock') {
+        const current = states.get(msg.entity_id);
+        serviceDomain = 'lock';
+        service = current && current.state === 'locked' ? 'unlock' : 'lock';
+      }
+      ha.send({
+        type: 'call_service',
+        domain: serviceDomain,
+        service,
+        target: { entity_id: msg.entity_id },
+      }).catch(logServiceError);
+      return;
+    }
+
+    case 'light_set': {
+      if (typeof msg.entity_id !== 'string' || !displayedEntities.has(msg.entity_id)) return;
+      if (msg.entity_id.split('.')[0] !== 'light') return;
+      const data = {};
+      if (Number.isFinite(msg.brightness)) {
+        data.brightness = Math.min(255, Math.max(0, Math.round(msg.brightness)));
+      }
+      if (
+        Array.isArray(msg.rgb_color) &&
+        msg.rgb_color.length === 3 &&
+        msg.rgb_color.every((v) => Number.isFinite(v))
+      ) {
+        data.rgb_color = msg.rgb_color.map((v) => Math.min(255, Math.max(0, Math.round(v))));
+      }
+      if (data.brightness === 0) {
+        ha.send({
+          type: 'call_service',
+          domain: 'light',
+          service: 'turn_off',
+          target: { entity_id: msg.entity_id },
+        }).catch(logServiceError);
+      } else if (Object.keys(data).length > 0) {
+        ha.send({
+          type: 'call_service',
+          domain: 'light',
+          service: 'turn_on',
+          service_data: data,
+          target: { entity_id: msg.entity_id },
+        }).catch(logServiceError);
+      }
+      return;
+    }
+
+    case 'layout_set': {
+      layout = sanitizeLayout(msg.layout);
+      saveLayoutSoon();
+      // Keep other browsers in sync; the sender already has this state.
+      const data = JSON.stringify({ type: 'layout', layout });
+      for (const client of wss.clients) {
+        if (client !== sender && client.readyState === WebSocket.OPEN) client.send(data);
+      }
+      return;
+    }
+  }
+}
+
+const ha = new HomeAssistant(WS_URL, TOKEN);
 
 server.listen(PORT, () => {
   console.log(`[hearth3d] Dashboard listening on http://0.0.0.0:${PORT}`);
@@ -474,7 +661,7 @@ cat > frontend/package.json <<'EOF'
 {
   "name": "hearth3d-frontend",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -510,6 +697,7 @@ export default defineConfig({
     proxy: {
       '/ws': { target: 'ws://localhost:8080', ws: true },
       '/health': 'http://localhost:8080',
+      '/api': 'http://localhost:8080',
     },
   },
 });
@@ -636,12 +824,16 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 /**
  * Maintains the WebSocket connection to the Hearth3D backend.
- * Exposes the room topology, a live entity-state map, connection flags,
- * and a toggle(entityId) command sender. Reconnects with backoff.
+ * Exposes the room topology, floors, live entity states, sensor history,
+ * the server-persisted layout config, connection flags, and command senders.
+ * Reconnects with backoff.
  */
 export default function useHearthSocket() {
   const [rooms, setRooms] = useState([]);
+  const [floors, setFloors] = useState([]);
   const [states, setStates] = useState({});
+  const [history, setHistory] = useState({});
+  const [serverConfig, setServerConfig] = useState(null);
   const [haConnected, setHaConnected] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
   const wsRef = useRef(null);
@@ -670,7 +862,9 @@ export default function useHearthSocket() {
         }
         if (msg.type === 'topology') {
           setRooms(msg.rooms);
+          setFloors(msg.floors || []);
           setStates(msg.states);
+          setHistory(msg.history || {});
         } else if (msg.type === 'state') {
           setStates((prev) => ({
             ...prev,
@@ -680,6 +874,18 @@ export default function useHearthSocket() {
               last_changed: msg.last_changed,
             },
           }));
+          if (msg.entity_id.startsWith('sensor.')) {
+            const value = parseFloat(msg.state);
+            if (Number.isFinite(value)) {
+              setHistory((prev) => {
+                const points = [...(prev[msg.entity_id] || []), { t: Date.now(), v: value }];
+                if (points.length > 60) points.shift();
+                return { ...prev, [msg.entity_id]: points };
+              });
+            }
+          }
+        } else if (msg.type === 'layout') {
+          setServerConfig(msg.layout);
         } else if (msg.type === 'ha_status') {
           setHaConnected(msg.connected);
         }
@@ -701,14 +907,454 @@ export default function useHearthSocket() {
     };
   }, []);
 
-  const toggle = useCallback((entityId) => {
+  const sendJson = useCallback((obj) => {
     const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'toggle', entity_id: entityId }));
-    }
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
   }, []);
 
-  return { rooms, states, haConnected, wsConnected, toggle };
+  const toggle = useCallback((entityId) => sendJson({ type: 'toggle', entity_id: entityId }), [sendJson]);
+  const lightSet = useCallback(
+    (entityId, payload) => sendJson({ type: 'light_set', entity_id: entityId, ...payload }),
+    [sendJson]
+  );
+  const sendConfig = useCallback((layout) => sendJson({ type: 'layout_set', layout }), [sendJson]);
+
+  return {
+    rooms,
+    floors,
+    states,
+    history,
+    serverConfig,
+    haConnected,
+    wsConnected,
+    toggle,
+    lightSet,
+    sendConfig,
+  };
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# Frontend: frontend/src/components/Icon.jsx
+# ---------------------------------------------------------------------------
+cat > frontend/src/components/Icon.jsx <<'EOF'
+const PATHS = {
+  light: (
+    <>
+      <circle cx="12" cy="9.5" r="5.5" />
+      <path d="M9.5 14.5v2.5h5v-2.5" />
+      <path d="M10.5 20.5h3" />
+    </>
+  ),
+  switch: (
+    <>
+      <path d="M12 3v8" />
+      <path d="M6.6 6.6a7.5 7.5 0 1 0 10.8 0" />
+    </>
+  ),
+  media_player: (
+    <>
+      <rect x="7" y="3.5" width="10" height="17" rx="2" />
+      <circle cx="12" cy="14.5" r="3" />
+      <circle cx="12" cy="7.5" r="1" />
+    </>
+  ),
+  fan: (
+    <>
+      <circle cx="12" cy="12" r="1.8" />
+      <path d="M12 10.2c-.5-3.8 1-6.2 3-6.2 1.8 0 2.6 1.8 1.4 3.4-1 1.4-2.8 2.3-4.4 2.8z" />
+      <path d="M13.8 12c3.8-.5 6.2 1 6.2 3 0 1.8-1.8 2.6-3.4 1.4-1.4-1-2.3-2.8-2.8-4.4z" />
+      <path d="M12 13.8c.5 3.8-1 6.2-3 6.2-1.8 0-2.6-1.8-1.4-3.4 1-1.4 2.8-2.3 4.4-2.8z" />
+      <path d="M10.2 12c-3.8.5-6.2-1-6.2-3 0-1.8 1.8-2.6 3.4-1.4 1.4 1 2.3 2.8 2.8 4.4z" />
+    </>
+  ),
+  cover: (
+    <>
+      <rect x="5" y="4" width="14" height="16" rx="1.5" />
+      <path d="M5 8.5h14" />
+      <path d="M5 13h14" />
+      <path d="M12 16.5v1.5" />
+    </>
+  ),
+  lock: (
+    <>
+      <rect x="6" y="11" width="12" height="9" rx="2" />
+      <path d="M9 11V8a3 3 0 0 1 6 0v3" />
+    </>
+  ),
+  climate: (
+    <>
+      <circle cx="12" cy="17" r="3.5" />
+      <rect x="10.5" y="3.5" width="3" height="10.5" rx="1.5" />
+    </>
+  ),
+  vacuum: (
+    <>
+      <circle cx="12" cy="12" r="8.5" />
+      <path d="M3.5 12h17" />
+      <circle cx="12" cy="8" r="1.5" />
+    </>
+  ),
+  camera: (
+    <>
+      <rect x="3" y="7" width="12.5" height="10" rx="2" />
+      <path d="M15.5 10.5 21 8v8l-5.5-2.5z" />
+    </>
+  ),
+  binary_sensor: (
+    <>
+      <path d="M3 12s3.5-6 9-6 9 6 9 6-3.5 6-9 6-9-6-9-6z" />
+      <circle cx="12" cy="12" r="2.5" />
+    </>
+  ),
+  sensor: <path d="M3 12h4l2.5-6.5 4 13 2.5-6.5H21" />,
+  default: <circle cx="12" cy="12" r="7" />,
+};
+
+export default function Icon({ domain, className }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden="true"
+    >
+      {PATHS[domain] || PATHS.default}
+    </svg>
+  );
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# Frontend: frontend/src/components/Sparkline.jsx
+# ---------------------------------------------------------------------------
+cat > frontend/src/components/Sparkline.jsx <<'EOF'
+export default function Sparkline({ points, className }) {
+  if (!points || points.length < 2) return null;
+  const w = 64;
+  const h = 18;
+  const pad = 2;
+  const values = points.map((p) => p.v);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min || 1;
+  const step = (w - pad * 2) / (points.length - 1);
+  const d = points
+    .map(
+      (p, i) =>
+        `${i === 0 ? 'M' : 'L'}${(pad + i * step).toFixed(1)} ${(
+          h - pad - ((p.v - min) / span) * (h - pad * 2)
+        ).toFixed(1)}`
+    )
+    .join(' ');
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className={className} aria-hidden="true">
+      <path d={d} fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# Frontend: frontend/src/components/Sheet.jsx
+# ---------------------------------------------------------------------------
+cat > frontend/src/components/Sheet.jsx <<'EOF'
+export default function Sheet({ title, onClose, children }) {
+  return (
+    <>
+      <div className="fixed inset-0 z-30 bg-slate-950/40" onClick={onClose} />
+      <div className="fixed bottom-6 left-1/2 z-40 w-[22rem] max-w-[calc(100vw-2rem)] -translate-x-1/2 rounded-2xl border border-slate-700 bg-slate-900/95 p-4 shadow-2xl backdrop-blur">
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <span className="truncate text-sm font-medium text-slate-100">{title}</span>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded px-2 text-slate-400 hover:text-slate-200"
+            aria-label="Close"
+          >
+            ✕
+          </button>
+        </div>
+        {children}
+      </div>
+    </>
+  );
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# Frontend: frontend/src/components/LightPanel.jsx
+# ---------------------------------------------------------------------------
+cat > frontend/src/components/LightPanel.jsx <<'EOF'
+import { useEffect, useRef, useState } from 'react';
+import Sheet from './Sheet';
+import Icon from './Icon';
+
+function rgbToHex(rgb) {
+  return (
+    '#' +
+    rgb
+      .map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0'))
+      .join('')
+  );
+}
+
+function hexToRgb(hex) {
+  return [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+}
+
+export default function LightPanel({ device, state, onClose, onToggle, onSet }) {
+  const isOn = state && state.state === 'on';
+  const [brightness, setBrightness] = useState(state?.attributes?.brightness ?? 255);
+  const [color, setColor] = useState(
+    state?.attributes?.rgb_color ? rgbToHex(state.attributes.rgb_color) : '#ffd28a'
+  );
+  const timerRef = useRef(null);
+
+  // Follow external changes (another client, a physical switch).
+  useEffect(() => {
+    if (state?.attributes?.brightness != null) setBrightness(state.attributes.brightness);
+  }, [state?.attributes?.brightness]);
+
+  const queue = (payload) => {
+    clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => onSet(payload), 180);
+  };
+
+  return (
+    <Sheet
+      onClose={onClose}
+      title={
+        <span className="flex items-center gap-2">
+          <Icon domain="light" className={`h-5 w-5 ${isOn ? 'text-amber-300' : 'text-slate-500'}`} />
+          {device.name}
+        </span>
+      }
+    >
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          onClick={onToggle}
+          className={`rounded-lg border px-3 py-1.5 text-xs ${
+            isOn
+              ? 'border-amber-500/60 bg-amber-500/20 text-amber-300'
+              : 'border-slate-700 text-slate-300 hover:bg-slate-800'
+          }`}
+        >
+          {isOn ? 'On' : 'Off'}
+        </button>
+        <input
+          type="range"
+          min="0"
+          max="255"
+          value={brightness}
+          onChange={(e) => {
+            const v = Number(e.target.value);
+            setBrightness(v);
+            queue({ brightness: v });
+          }}
+          className="flex-1 accent-amber-400"
+          aria-label="Brightness"
+        />
+        <input
+          type="color"
+          value={color}
+          onChange={(e) => {
+            setColor(e.target.value);
+            queue({ rgb_color: hexToRgb(e.target.value) });
+          }}
+          className="h-8 w-8 cursor-pointer rounded border border-slate-700 bg-transparent"
+          aria-label="Color"
+        />
+      </div>
+      <p className="mt-2 text-[10px] text-slate-500">
+        Brightness {Math.round((brightness / 255) * 100)}%
+      </p>
+    </Sheet>
+  );
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# Frontend: frontend/src/components/DevicePanel.jsx
+# ---------------------------------------------------------------------------
+cat > frontend/src/components/DevicePanel.jsx <<'EOF'
+import { useState } from 'react';
+import Sheet from './Sheet';
+
+export default function DevicePanel({ device, roomId, rooms, onClose, onApply, onHide }) {
+  const [name, setName] = useState(device.name);
+
+  return (
+    <Sheet title="Edit device" onClose={onClose}>
+      <div className="space-y-3">
+        <label className="block text-xs text-slate-400">
+          Name <span className="text-slate-600">(clear to restore the Home Assistant name)</span>
+          <input
+            value={name}
+            onChange={(e) => {
+              setName(e.target.value);
+              onApply({ name: e.target.value.trim() });
+            }}
+            className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800/80 px-2 py-1.5 text-sm text-slate-100 outline-none focus:border-amber-500/60"
+          />
+        </label>
+        <label className="block text-xs text-slate-400">
+          Room
+          <select
+            value={roomId}
+            onChange={(e) => onApply({ room: e.target.value === device.home ? '' : e.target.value })}
+            className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800/80 px-2 py-1.5 text-sm text-slate-100 outline-none focus:border-amber-500/60"
+          >
+            {rooms.map((room) => (
+              <option key={room.area_id} value={room.area_id}>
+                {room.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="flex items-center justify-between pt-1">
+          <span className="max-w-[55%] truncate text-[10px] text-slate-500">{device.entity_id}</span>
+          <button
+            type="button"
+            onClick={onHide}
+            className="rounded-lg border border-red-500/50 px-3 py-1.5 text-xs text-red-300 hover:bg-red-500/10"
+          >
+            Hide device
+          </button>
+        </div>
+      </div>
+    </Sheet>
+  );
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# Frontend: frontend/src/components/RoomPanel.jsx
+# ---------------------------------------------------------------------------
+cat > frontend/src/components/RoomPanel.jsx <<'EOF'
+import { useState } from 'react';
+import Sheet from './Sheet';
+
+export default function RoomPanel({ room, floors, onClose, onApply, onHide }) {
+  const [name, setName] = useState(room.name);
+
+  const handleFloorChange = (value) => {
+    if (value === (room.ha_floor || '')) {
+      onApply({ floor: '' }); // matches the HA assignment — drop the override
+    } else if (value === '') {
+      onApply({ floor: room.ha_floor ? '_none' : '' }); // explicit "no floor"
+    } else {
+      onApply({ floor: value });
+    }
+  };
+
+  return (
+    <Sheet title="Edit room" onClose={onClose}>
+      <div className="space-y-3">
+        <label className="block text-xs text-slate-400">
+          Name <span className="text-slate-600">(clear to restore the Home Assistant name)</span>
+          <input
+            value={name}
+            onChange={(e) => {
+              setName(e.target.value);
+              onApply({ name: e.target.value.trim() });
+            }}
+            className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800/80 px-2 py-1.5 text-sm text-slate-100 outline-none focus:border-amber-500/60"
+          />
+        </label>
+        <label className="block text-xs text-slate-400">
+          Floor
+          <select
+            value={room.floor_id || ''}
+            onChange={(e) => handleFloorChange(e.target.value)}
+            className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800/80 px-2 py-1.5 text-sm text-slate-100 outline-none focus:border-amber-500/60"
+          >
+            <option value="">No floor</option>
+            {floors.map((floor) => (
+              <option key={floor.id} value={floor.id}>
+                {floor.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="flex justify-end pt-1">
+          <button
+            type="button"
+            onClick={onHide}
+            className="rounded-lg border border-red-500/50 px-3 py-1.5 text-xs text-red-300 hover:bg-red-500/10"
+          >
+            Hide room
+          </button>
+        </div>
+      </div>
+    </Sheet>
+  );
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# Frontend: frontend/src/components/HiddenPanel.jsx
+# ---------------------------------------------------------------------------
+cat > frontend/src/components/HiddenPanel.jsx <<'EOF'
+import Sheet from './Sheet';
+
+export default function HiddenPanel({ hiddenRooms, hiddenDevices, onShowRoom, onShowDevice, onClose }) {
+  const empty = hiddenRooms.length === 0 && hiddenDevices.length === 0;
+
+  return (
+    <Sheet title="Hidden items" onClose={onClose}>
+      {empty && (
+        <p className="text-xs text-slate-500">
+          Nothing is hidden. Hide rooms or devices from their edit panels.
+        </p>
+      )}
+      {hiddenRooms.length > 0 && (
+        <>
+          <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Rooms</p>
+          <ul className="mb-3 space-y-1.5">
+            {hiddenRooms.map((room) => (
+              <li key={room.area_id} className="flex items-center justify-between gap-2 text-xs text-slate-300">
+                <span className="truncate">{room.name}</span>
+                <button
+                  type="button"
+                  onClick={() => onShowRoom(room.area_id)}
+                  className="shrink-0 text-emerald-400 hover:underline"
+                >
+                  Show
+                </button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {hiddenDevices.length > 0 && (
+        <>
+          <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Devices</p>
+          <ul className="space-y-1.5">
+            {hiddenDevices.map((device) => (
+              <li key={device.entity_id} className="flex items-center justify-between gap-2 text-xs text-slate-300">
+                <span className="truncate">
+                  {device.name} <span className="text-slate-600">· {device.roomName}</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => onShowDevice(device.entity_id)}
+                  className="shrink-0 text-emerald-400 hover:underline"
+                >
+                  Show
+                </button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </Sheet>
+  );
 }
 EOF
 
@@ -716,18 +1362,9 @@ EOF
 # Frontend: frontend/src/components/DeviceNode.jsx
 # ---------------------------------------------------------------------------
 cat > frontend/src/components/DeviceNode.jsx <<'EOF'
-const ICONS = {
-  light: '💡',
-  switch: '🔌',
-  media_player: '🔊',
-  fan: '🌀',
-  cover: '🪟',
-  lock: '🔒',
-  climate: '🌡️',
-  vacuum: '🤖',
-  binary_sensor: '👁️',
-  sensor: '📈',
-};
+import { useEffect, useRef, useState } from 'react';
+import Icon from './Icon';
+import Sparkline from './Sparkline';
 
 const ACTIVE_STATES = [
   'on',
@@ -747,20 +1384,57 @@ const ACTIVE_STATES = [
 const TOGGLABLE_DOMAINS = ['light', 'switch', 'fan', 'media_player', 'cover', 'lock'];
 
 const ACTIVE_STYLES = {
-  light: 'bg-amber-400/20 ring-amber-400/70 shadow-[0_0_24px_4px_rgba(251,191,36,0.45)]',
-  switch: 'bg-emerald-400/20 ring-emerald-400/70 shadow-[0_0_20px_2px_rgba(52,211,153,0.4)]',
-  media_player: 'bg-sky-400/20 ring-sky-400/70 shadow-[0_0_20px_2px_rgba(56,189,248,0.4)]',
-  fan: 'bg-cyan-400/20 ring-cyan-400/70 shadow-[0_0_20px_2px_rgba(34,211,238,0.4)]',
-  cover: 'bg-violet-400/20 ring-violet-400/70 shadow-[0_0_20px_2px_rgba(167,139,250,0.4)]',
-  lock: 'bg-red-400/20 ring-red-400/70 shadow-[0_0_20px_2px_rgba(248,113,113,0.4)]',
-  default: 'bg-emerald-400/20 ring-emerald-400/70 shadow-[0_0_20px_2px_rgba(52,211,153,0.4)]',
+  light: 'bg-amber-400/25 text-amber-300 ring-amber-400/80 shadow-[0_0_26px_5px_rgba(251,191,36,0.5)]',
+  switch: 'bg-emerald-400/20 text-emerald-300 ring-emerald-400/70 shadow-[0_0_20px_2px_rgba(52,211,153,0.4)]',
+  media_player: 'bg-sky-400/20 text-sky-300 ring-sky-400/70 shadow-[0_0_20px_2px_rgba(56,189,248,0.4)]',
+  fan: 'bg-cyan-400/20 text-cyan-300 ring-cyan-400/70 shadow-[0_0_20px_2px_rgba(34,211,238,0.4)]',
+  cover: 'bg-violet-400/20 text-violet-300 ring-violet-400/70 shadow-[0_0_20px_2px_rgba(167,139,250,0.4)]',
+  lock: 'bg-red-400/20 text-red-300 ring-red-400/70 shadow-[0_0_20px_2px_rgba(248,113,113,0.4)]',
+  default: 'bg-emerald-400/20 text-emerald-300 ring-emerald-400/70 shadow-[0_0_20px_2px_rgba(52,211,153,0.4)]',
 };
 
-export default function DeviceNode({ device, state, pos, editMode, onDragStart, onToggle }) {
+function CameraImage({ entityId }) {
+  const [tick, setTick] = useState(0);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    const timer = setInterval(() => setTick((v) => v + 1), 10000);
+    return () => clearInterval(timer);
+  }, []);
+
+  if (failed) {
+    return (
+      <span className="flex h-11 w-11 items-center justify-center">
+        <Icon domain="camera" className="h-5 w-5" />
+      </span>
+    );
+  }
+  return (
+    <img
+      src={`/api/camera/${entityId}?t=${tick}`}
+      onError={() => setFailed(true)}
+      alt=""
+      className="h-16 w-24 object-cover"
+      draggable="false"
+    />
+  );
+}
+
+export default function DeviceNode({
+  device,
+  state,
+  history,
+  pos,
+  editMode,
+  onDragStart,
+  onEditClick,
+  onToggle,
+  onOpenLight,
+}) {
+  const pressRef = useRef(null);
   const stateStr = state ? state.state : 'unknown';
   const isActive = ACTIVE_STATES.includes(stateStr);
   const canToggle = TOGGLABLE_DOMAINS.includes(device.domain);
-  const icon = ICONS[device.domain] || '⚪';
 
   let detail = null;
   if (device.domain === 'sensor' && state) {
@@ -770,34 +1444,95 @@ export default function DeviceNode({ device, state, pos, editMode, onDragStart, 
     detail = `${state.attributes.current_temperature}°`;
   } else if (device.domain === 'media_player' && stateStr === 'playing' && state.attributes.media_title) {
     detail = state.attributes.media_title;
+  } else if (device.domain === 'light' && isActive && state.attributes.brightness != null) {
+    detail = `${Math.round((state.attributes.brightness / 255) * 100)}%`;
   }
 
-  const handleClick = () => {
-    if (editMode || !canToggle) return;
-    onToggle();
+  const clearPress = () => {
+    if (pressRef.current && pressRef.current !== 'fired') {
+      clearTimeout(pressRef.current);
+      pressRef.current = null;
+    }
   };
+
+  const handlePointerDown = (e) => {
+    if (editMode) {
+      onDragStart(e);
+      return;
+    }
+    if (device.domain === 'light') {
+      pressRef.current = setTimeout(() => {
+        pressRef.current = 'fired';
+        onOpenLight();
+      }, 500);
+    }
+  };
+
+  const handleClick = () => {
+    if (pressRef.current === 'fired') {
+      pressRef.current = null;
+      return;
+    }
+    clearPress();
+    if (editMode) {
+      onEditClick();
+      return;
+    }
+    if (canToggle) onToggle();
+  };
+
+  const handleContextMenu = (e) => {
+    if (!editMode && device.domain === 'light') {
+      e.preventDefault();
+      onOpenLight();
+    }
+  };
+
+  const isCamera = device.domain === 'camera';
+  const chipClass = isCamera
+    ? `overflow-hidden rounded-xl bg-slate-800/90 ring-1 ring-slate-600/70 transition-all duration-300 ${
+        editMode ? 'cursor-grab active:cursor-grabbing' : 'cursor-default'
+      }`
+    : `flex h-11 w-11 select-none items-center justify-center rounded-full ring-1 transition-all duration-300 ${
+        isActive
+          ? ACTIVE_STYLES[device.domain] || ACTIVE_STYLES.default
+          : 'bg-slate-800/90 text-slate-300 ring-slate-500/70'
+      } ${
+        editMode
+          ? 'cursor-grab active:cursor-grabbing'
+          : canToggle
+            ? 'cursor-pointer hover:scale-110'
+            : 'cursor-default'
+      }`;
 
   return (
     <div className="device-node absolute z-10" style={{ left: `${pos.x}%`, top: `${pos.y}%` }}>
-      <div className="device-billboard flex w-max max-w-[110px] flex-col items-center gap-1">
+      <div className="device-billboard flex w-max max-w-[120px] flex-col items-center gap-1">
         <button
           type="button"
-          onPointerDown={onDragStart}
+          onPointerDown={handlePointerDown}
+          onPointerLeave={clearPress}
           onClick={handleClick}
+          onContextMenu={handleContextMenu}
           title={`${device.name} — ${stateStr}`}
-          className={`flex h-11 w-11 select-none items-center justify-center rounded-full text-lg ring-1 transition-all duration-300
-            ${isActive ? ACTIVE_STYLES[device.domain] || ACTIVE_STYLES.default : 'bg-slate-800/90 ring-slate-600/60 opacity-80 grayscale'}
-            ${editMode ? 'cursor-grab active:cursor-grabbing' : canToggle ? 'cursor-pointer hover:scale-110' : 'cursor-default'}`}
+          className={chipClass}
         >
-          {icon}
+          {isCamera ? (
+            <CameraImage entityId={device.entity_id} />
+          ) : (
+            <Icon domain={device.domain} className="h-5 w-5" />
+          )}
         </button>
-        <span className="pointer-events-none max-w-[100px] truncate rounded bg-slate-950/70 px-1.5 py-0.5 text-[10px] leading-tight text-slate-300">
+        <span className="pointer-events-none max-w-[110px] truncate rounded bg-slate-950/80 px-1.5 py-0.5 text-[10px] leading-tight text-slate-200">
           {device.name}
         </span>
         {detail && (
-          <span className="pointer-events-none max-w-[100px] truncate text-[9px] text-slate-400">
+          <span className="pointer-events-none max-w-[110px] truncate text-[9px] text-slate-400">
             {detail}
           </span>
+        )}
+        {device.domain === 'sensor' && history && history.length > 1 && (
+          <Sparkline points={history} className="pointer-events-none h-4 w-16 text-sky-400/80" />
         )}
       </div>
     </div>
@@ -826,10 +1561,24 @@ function defaultPos(index, count) {
 
 const ACTIVE_STATES = ['on', 'playing', 'open', 'unlocked'];
 
-export default function RoomCard({ room, states, layout, editMode, onMove, onToggle }) {
+export default function RoomCard({
+  room,
+  states,
+  history,
+  positions,
+  editMode,
+  onMove,
+  onToggle,
+  onOpenLight,
+  onOpenDeviceSettings,
+  onOpenRoomSettings,
+  onReorder,
+}) {
   const cardRef = useRef(null);
+  const movedRef = useRef(false);
+  const visibleDevices = room.devices.filter((d) => !d.hidden);
 
-  const activeCount = room.devices.filter((d) => {
+  const activeCount = visibleDevices.filter((d) => {
     const s = states[d.entity_id];
     return s && ACTIVE_STATES.includes(s.state);
   }).length;
@@ -837,8 +1586,15 @@ export default function RoomCard({ room, states, layout, editMode, onMove, onTog
   const startDrag = (e, entityId) => {
     if (!editMode) return;
     e.preventDefault();
+    movedRef.current = false;
+    const startX = e.clientX;
+    const startY = e.clientY;
     const rect = cardRef.current.getBoundingClientRect();
     const move = (ev) => {
+      if (!movedRef.current && Math.abs(ev.clientX - startX) + Math.abs(ev.clientY - startY) < 5) {
+        return;
+      }
+      movedRef.current = true;
       onMove(entityId, {
         x: Math.min(94, Math.max(6, ((ev.clientX - rect.left) / rect.width) * 100)),
         y: Math.min(92, Math.max(10, ((ev.clientY - rect.top) / rect.height) * 100)),
@@ -871,26 +1627,70 @@ export default function RoomCard({ room, states, layout, editMode, onMove, onTog
           backgroundSize: '28px 28px',
         }}
       />
-      <div className="pointer-events-none absolute left-3 right-3 top-3 flex items-baseline justify-between">
-        <span className="truncate text-sm font-medium text-slate-200">{room.name}</span>
-        <span className="text-[10px] text-slate-500">
-          {room.devices.length} device{room.devices.length === 1 ? '' : 's'}
+      <div className="absolute left-3 right-3 top-3 z-20 flex items-baseline justify-between gap-2">
+        <button
+          type="button"
+          onClick={() => editMode && onOpenRoomSettings(room.area_id)}
+          className={`truncate text-sm font-medium text-slate-100 ${
+            editMode
+              ? 'cursor-pointer underline decoration-dotted underline-offset-4 hover:text-amber-300'
+              : 'pointer-events-none'
+          }`}
+        >
+          {room.name}
+        </button>
+        <span className="pointer-events-none shrink-0 text-[10px] text-slate-400">
+          {visibleDevices.length} device{visibleDevices.length === 1 ? '' : 's'}
         </span>
       </div>
-      {room.devices.map((device, i) => {
-        const pos = layout[device.entity_id] || defaultPos(i, room.devices.length);
+      {editMode && (
+        <div className="absolute bottom-2 right-2 z-20 flex gap-1">
+          <button
+            type="button"
+            onClick={() => onReorder(room.area_id, -1)}
+            className="h-6 w-6 rounded bg-slate-800/90 text-xs text-slate-300 ring-1 ring-slate-600/60 hover:bg-slate-700"
+            aria-label="Move room earlier"
+          >
+            ‹
+          </button>
+          <button
+            type="button"
+            onClick={() => onReorder(room.area_id, 1)}
+            className="h-6 w-6 rounded bg-slate-800/90 text-xs text-slate-300 ring-1 ring-slate-600/60 hover:bg-slate-700"
+            aria-label="Move room later"
+          >
+            ›
+          </button>
+        </div>
+      )}
+      {visibleDevices.map((device, i) => {
+        const saved = positions[device.entity_id];
+        const pos =
+          saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)
+            ? { x: saved.x, y: saved.y }
+            : defaultPos(i, visibleDevices.length);
         return (
           <DeviceNode
             key={device.entity_id}
             device={device}
             state={states[device.entity_id]}
+            history={history[device.entity_id]}
             pos={pos}
             editMode={editMode}
             onDragStart={(e) => startDrag(e, device.entity_id)}
+            onEditClick={() => {
+              if (!movedRef.current) onOpenDeviceSettings(device.entity_id);
+            }}
             onToggle={() => onToggle(device.entity_id)}
+            onOpenLight={() => onOpenLight(device.entity_id)}
           />
         );
       })}
+      {editMode && visibleDevices.length === 0 && (
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-[11px] text-slate-600">
+          Empty room
+        </div>
+      )}
     </div>
   );
 }
@@ -900,39 +1700,262 @@ EOF
 # Frontend: frontend/src/App.jsx
 # ---------------------------------------------------------------------------
 cat > frontend/src/App.jsx <<'EOF'
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import useHearthSocket from './hooks/useHearthSocket';
 import RoomCard from './components/RoomCard';
+import LightPanel from './components/LightPanel';
+import DevicePanel from './components/DevicePanel';
+import RoomPanel from './components/RoomPanel';
+import HiddenPanel from './components/HiddenPanel';
 
 const LAYOUT_KEY = 'hearth3d-layout';
+const EMPTY_CONFIG = { devices: {}, rooms: {}, roomOrder: [], floors: [] };
 
-function loadLayout() {
+function normalizeConfig(raw) {
+  if (!raw || typeof raw !== 'object') return { ...EMPTY_CONFIG };
+  if (!raw.devices && !raw.rooms && !raw.roomOrder && !raw.floors) {
+    // Legacy flat format: { entity_id: { x, y } }
+    return { ...EMPTY_CONFIG, devices: raw };
+  }
+  return {
+    devices: raw.devices || {},
+    rooms: raw.rooms || {},
+    roomOrder: raw.roomOrder || [],
+    floors: raw.floors || [],
+  };
+}
+
+function loadLocalConfig() {
   try {
-    return JSON.parse(localStorage.getItem(LAYOUT_KEY)) || {};
+    return normalizeConfig(JSON.parse(localStorage.getItem(LAYOUT_KEY)));
   } catch {
-    return {};
+    return { ...EMPTY_CONFIG };
   }
 }
 
+function configHasData(c) {
+  return (
+    Object.keys(c.devices).length > 0 ||
+    Object.keys(c.rooms).length > 0 ||
+    c.roomOrder.length > 0 ||
+    c.floors.length > 0
+  );
+}
+
 export default function App() {
-  const { rooms, states, haConnected, wsConnected, toggle } = useHearthSocket();
-  const [editMode, setEditMode] = useState(false);
-  const [layout, setLayout] = useState(loadLayout);
+  const {
+    rooms,
+    floors: haFloors,
+    states,
+    history,
+    serverConfig,
+    haConnected,
+    wsConnected,
+    toggle,
+    lightSet,
+    sendConfig,
+  } = useHearthSocket();
+  // ?edit in the URL opens the dashboard in edit mode (handy for docs/tests).
+  const [editMode, setEditMode] = useState(() => new URLSearchParams(window.location.search).has('edit'));
+  const [config, setConfig] = useState(loadLocalConfig);
+  const [activeFloor, setActiveFloor] = useState('all');
+  const [sheet, setSheet] = useState(null); // { type: 'light'|'device'|'room'|'hidden', id? }
+  const [newFloorName, setNewFloorName] = useState(null); // null = closed, string = input open
+  const dirtyRef = useRef(false);
+  const syncedRef = useRef(false);
 
-  // Persist the custom layout to local storage (debounced past drag events).
+  // Adopt the server-persisted config (shared across browsers). On first
+  // contact with an empty server, migrate this browser's local copy up.
   useEffect(() => {
-    const timer = setTimeout(() => localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout)), 300);
-    return () => clearTimeout(timer);
-  }, [layout]);
+    if (serverConfig == null) return;
+    const server = normalizeConfig(serverConfig);
+    if (configHasData(server)) {
+      setConfig(server);
+    } else if (!syncedRef.current) {
+      setConfig((local) => {
+        if (configHasData(local)) sendConfig(local);
+        return local;
+      });
+    }
+    syncedRef.current = true;
+  }, [serverConfig, sendConfig]);
 
-  const moveDevice = useCallback((entityId, pos) => {
-    setLayout((prev) => ({ ...prev, [entityId]: pos }));
+  // Persist locally always; push to the server only for changes made here
+  // (server-applied updates must not echo back, or two browsers ping-pong).
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      localStorage.setItem(LAYOUT_KEY, JSON.stringify(config));
+      if (dirtyRef.current) {
+        dirtyRef.current = false;
+        sendConfig(config);
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [config, sendConfig]);
+
+  useEffect(() => setSheet(null), [editMode]);
+
+  const update = useCallback((fn) => {
+    dirtyRef.current = true;
+    setConfig((prev) => fn(prev));
   }, []);
 
-  const resetLayout = () => {
-    localStorage.removeItem(LAYOUT_KEY);
-    setLayout({});
+  // Merges a patch into an override map entry; empty-string/false/undefined
+  // values delete the key so cleared overrides fall back to HA data.
+  const patchOverride = (map, id, patch) => {
+    const cur = { ...(map[id] || {}), ...patch };
+    for (const k of Object.keys(cur)) {
+      if (cur[k] === undefined || cur[k] === '' || cur[k] === false) delete cur[k];
+    }
+    const next = { ...map };
+    if (Object.keys(cur).length > 0) next[id] = cur;
+    else delete next[id];
+    return next;
   };
+
+  const setDeviceOverride = useCallback(
+    (entityId, patch) => update((prev) => ({ ...prev, devices: patchOverride(prev.devices, entityId, patch) })),
+    [update]
+  );
+  const setRoomOverride = useCallback(
+    (areaId, patch) => update((prev) => ({ ...prev, rooms: patchOverride(prev.rooms, areaId, patch) })),
+    [update]
+  );
+  const moveDevice = useCallback((entityId, pos) => setDeviceOverride(entityId, pos), [setDeviceOverride]);
+
+  const resetConfig = () => {
+    if (!window.confirm('Reset all customizations (positions, renames, hidden items, floors)?')) return;
+    update(() => ({ devices: {}, rooms: {}, roomOrder: [], floors: [] }));
+  };
+
+  // ---- derived data ----
+
+  const allFloors = useMemo(() => {
+    const list = haFloors.map((f) => ({ id: f.floor_id, name: f.name, custom: false }));
+    for (const f of config.floors) list.push({ id: f.id, name: f.name, custom: true });
+    return list;
+  }, [haFloors, config.floors]);
+
+  const mergedRooms = useMemo(() => {
+    const byId = new Map();
+    for (const room of rooms) {
+      const o = config.rooms[room.area_id] || {};
+      byId.set(room.area_id, {
+        ...room,
+        name: o.name || room.name,
+        ha_floor: room.floor_id || null,
+        floor_id: o.floor === '_none' ? null : o.floor || room.floor_id || null,
+        hidden: !!o.hidden,
+        devices: [],
+      });
+    }
+    for (const room of rooms) {
+      for (const device of room.devices) {
+        const o = config.devices[device.entity_id] || {};
+        const target = o.room && byId.has(o.room) ? o.room : room.area_id;
+        byId.get(target).devices.push({
+          ...device,
+          name: o.name || device.name,
+          hidden: !!o.hidden,
+          home: room.area_id,
+        });
+      }
+    }
+    return [...byId.values()];
+  }, [rooms, config.rooms, config.devices]);
+
+  const orderedRooms = useMemo(() => {
+    const idx = new Map(config.roomOrder.map((id, i) => [id, i]));
+    return [...mergedRooms].sort((a, b) => {
+      const ai = idx.has(a.area_id) ? idx.get(a.area_id) : Infinity;
+      const bi = idx.has(b.area_id) ? idx.get(b.area_id) : Infinity;
+      if (ai !== bi) return ai - bi;
+      return a.name.localeCompare(b.name);
+    });
+  }, [mergedRooms, config.roomOrder]);
+
+  const hasFloors = allFloors.length > 0;
+  const hasFloorless = orderedRooms.some((r) => !r.hidden && !r.floor_id);
+
+  const visibleRooms = useMemo(
+    () =>
+      orderedRooms.filter((room) => {
+        if (room.hidden) return false;
+        if (!editMode && room.devices.filter((d) => !d.hidden).length === 0) return false;
+        if (hasFloors && activeFloor !== 'all') {
+          if (activeFloor === '_none') return !room.floor_id;
+          return room.floor_id === activeFloor;
+        }
+        return true;
+      }),
+    [orderedRooms, editMode, hasFloors, activeFloor]
+  );
+
+  const hiddenRooms = orderedRooms.filter((r) => r.hidden);
+  const hiddenDevices = useMemo(() => {
+    const list = [];
+    for (const room of mergedRooms) {
+      for (const d of room.devices) if (d.hidden) list.push({ ...d, roomName: room.name });
+    }
+    return list;
+  }, [mergedRooms]);
+  const hiddenCount = hiddenRooms.length + hiddenDevices.length;
+
+  const [sheetDevice, sheetRoomId] = useMemo(() => {
+    if (!sheet || (sheet.type !== 'light' && sheet.type !== 'device')) return [null, null];
+    for (const room of mergedRooms) {
+      for (const d of room.devices) if (d.entity_id === sheet.id) return [d, room.area_id];
+    }
+    return [null, null];
+  }, [sheet, mergedRooms]);
+  const sheetRoom =
+    sheet && sheet.type === 'room' ? mergedRooms.find((r) => r.area_id === sheet.id) : null;
+
+  // ---- actions ----
+
+  const reorderRoom = (areaId, dir) => {
+    const visibleIds = visibleRooms.map((r) => r.area_id);
+    const vi = visibleIds.indexOf(areaId);
+    const targetId = visibleIds[vi + dir];
+    if (!targetId) return;
+    const ids = orderedRooms.map((r) => r.area_id);
+    const i = ids.indexOf(areaId);
+    const j = ids.indexOf(targetId);
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+    update((prev) => ({ ...prev, roomOrder: ids }));
+  };
+
+  const addFloor = (name) => {
+    const clean = name.trim();
+    if (!clean) return;
+    const id = `custom-${Date.now().toString(36)}`;
+    update((prev) => ({ ...prev, floors: [...prev.floors, { id, name: clean }] }));
+    setActiveFloor(id);
+  };
+
+  const removeFloor = (id) => {
+    update((prev) => {
+      const roomsCfg = { ...prev.rooms };
+      for (const [rid, o] of Object.entries(roomsCfg)) {
+        if (o.floor === id) {
+          const { floor, ...rest } = o;
+          if (Object.keys(rest).length > 0) roomsCfg[rid] = rest;
+          else delete roomsCfg[rid];
+        }
+      }
+      return { ...prev, rooms: roomsCfg, floors: prev.floors.filter((f) => f.id !== id) };
+    });
+    if (activeFloor === id) setActiveFloor('all');
+  };
+
+  const floorTabs = [
+    { id: 'all', name: 'All floors', custom: false },
+    ...allFloors,
+    ...(hasFloorless && hasFloors ? [{ id: '_none', name: 'Other', custom: false }] : []),
+  ];
+
+  // Roughly square arrangement reads best under the isometric projection.
+  const gridCols = Math.min(4, Math.max(2, Math.ceil(Math.sqrt(visibleRooms.length || 1))));
 
   return (
     <div className="flex min-h-screen flex-col">
@@ -953,13 +1976,22 @@ export default function App() {
         </div>
         <div className="flex items-center gap-2">
           {editMode && (
-            <button
-              type="button"
-              onClick={resetLayout}
-              className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-800"
-            >
-              Reset layout
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={() => setSheet({ type: 'hidden' })}
+                className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-800"
+              >
+                Hidden ({hiddenCount})
+              </button>
+              <button
+                type="button"
+                onClick={resetConfig}
+                className="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-800"
+              >
+                Reset all
+              </button>
+            </>
           )}
           <button
             type="button"
@@ -975,6 +2007,63 @@ export default function App() {
         </div>
       </header>
 
+      {(hasFloors || editMode) && (
+        <div className="flex flex-wrap items-center justify-center gap-2 border-b border-slate-800/60 bg-slate-950/50 px-6 py-2">
+          {floorTabs.map((tab) => (
+            <span key={tab.id} className="inline-flex items-center">
+              <button
+                type="button"
+                onClick={() => setActiveFloor(tab.id)}
+                className={`rounded-full px-3 py-1 text-xs transition-colors ${
+                  activeFloor === tab.id
+                    ? 'bg-sky-500/20 text-sky-300 ring-1 ring-sky-500/50'
+                    : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                }`}
+              >
+                {tab.name}
+              </button>
+              {editMode && tab.custom && (
+                <button
+                  type="button"
+                  onClick={() => removeFloor(tab.id)}
+                  className="ml-0.5 rounded px-1 text-xs text-slate-600 hover:text-red-400"
+                  aria-label={`Delete floor ${tab.name}`}
+                >
+                  ✕
+                </button>
+              )}
+            </span>
+          ))}
+          {editMode &&
+            (newFloorName === null ? (
+              <button
+                type="button"
+                onClick={() => setNewFloorName('')}
+                className="rounded-full border border-dashed border-slate-600 px-3 py-1 text-xs text-slate-400 hover:border-slate-400 hover:text-slate-200"
+              >
+                + Floor
+              </button>
+            ) : (
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  addFloor(newFloorName);
+                  setNewFloorName(null);
+                }}
+              >
+                <input
+                  autoFocus
+                  value={newFloorName}
+                  onChange={(e) => setNewFloorName(e.target.value)}
+                  onBlur={() => setNewFloorName(null)}
+                  placeholder="Floor name…"
+                  className="w-28 rounded-full border border-slate-600 bg-slate-800/80 px-3 py-1 text-xs text-slate-100 outline-none focus:border-sky-500/60"
+                />
+              </form>
+            ))}
+        </div>
+      )}
+
       {!wsConnected && (
         <div className="border-b border-red-500/20 bg-red-500/10 px-6 py-2 text-center text-xs text-red-300">
           Connection to Hearth3D server lost — reconnecting…
@@ -987,40 +2076,96 @@ export default function App() {
       )}
       {editMode && (
         <div className="border-b border-sky-500/20 bg-sky-500/10 px-6 py-2 text-center text-xs text-sky-300">
-          Edit mode: the view is flattened — drag devices to reposition them. Positions save
-          automatically to this browser.
+          Edit mode — drag devices to reposition · click a device to rename, move, or hide it ·
+          click a room name to rename it or change its floor · use ‹ › to reorder rooms. Changes
+          save automatically for everyone.
         </div>
       )}
 
       <main className="flex flex-1 justify-center px-6 py-20">
-        {rooms.length === 0 ? (
+        {visibleRooms.length === 0 ? (
           <div className="self-center text-center text-slate-500">
             <div className="mb-3 animate-pulse text-4xl">🏠</div>
             <p className="text-sm">
               {haConnected
-                ? 'No rooms found. Assign your devices to areas in Home Assistant.'
+                ? 'No rooms to show. Assign devices to areas in Home Assistant, or check the Hidden panel in edit mode.'
                 : 'Waiting for room and device topology…'}
             </p>
           </div>
         ) : (
           <div
-            className={`iso-plane ${editMode ? 'flat' : ''} grid w-full max-w-6xl content-start gap-8`}
-            style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(230px, 1fr))' }}
+            className={`iso-plane ${editMode ? 'flat' : ''} grid w-full content-start gap-8`}
+            style={{
+              gridTemplateColumns: `repeat(${gridCols}, minmax(0, 1fr))`,
+              maxWidth: `${gridCols * 330}px`,
+            }}
           >
-            {rooms.map((room) => (
+            {visibleRooms.map((room) => (
               <RoomCard
                 key={room.area_id}
                 room={room}
                 states={states}
-                layout={layout}
+                history={history}
+                positions={config.devices}
                 editMode={editMode}
                 onMove={moveDevice}
                 onToggle={toggle}
+                onOpenLight={(id) => setSheet({ type: 'light', id })}
+                onOpenDeviceSettings={(id) => setSheet({ type: 'device', id })}
+                onOpenRoomSettings={(id) => setSheet({ type: 'room', id })}
+                onReorder={reorderRoom}
               />
             ))}
           </div>
         )}
       </main>
+
+      {sheet && sheet.type === 'light' && sheetDevice && (
+        <LightPanel
+          key={sheet.id}
+          device={sheetDevice}
+          state={states[sheetDevice.entity_id]}
+          onClose={() => setSheet(null)}
+          onToggle={() => toggle(sheetDevice.entity_id)}
+          onSet={(payload) => lightSet(sheetDevice.entity_id, payload)}
+        />
+      )}
+      {sheet && sheet.type === 'device' && sheetDevice && (
+        <DevicePanel
+          key={sheet.id}
+          device={sheetDevice}
+          roomId={sheetRoomId}
+          rooms={orderedRooms.filter((r) => !r.hidden)}
+          onClose={() => setSheet(null)}
+          onApply={(patch) => setDeviceOverride(sheetDevice.entity_id, patch)}
+          onHide={() => {
+            setDeviceOverride(sheetDevice.entity_id, { hidden: true });
+            setSheet(null);
+          }}
+        />
+      )}
+      {sheet && sheet.type === 'room' && sheetRoom && (
+        <RoomPanel
+          key={sheet.id}
+          room={sheetRoom}
+          floors={allFloors}
+          onClose={() => setSheet(null)}
+          onApply={(patch) => setRoomOverride(sheetRoom.area_id, patch)}
+          onHide={() => {
+            setRoomOverride(sheetRoom.area_id, { hidden: true });
+            setSheet(null);
+          }}
+        />
+      )}
+      {sheet && sheet.type === 'hidden' && (
+        <HiddenPanel
+          hiddenRooms={hiddenRooms}
+          hiddenDevices={hiddenDevices}
+          onShowRoom={(id) => setRoomOverride(id, { hidden: false })}
+          onShowDevice={(id) => setDeviceOverride(id, { hidden: false })}
+          onClose={() => setSheet(null)}
+        />
+      )}
     </div>
   );
 }
@@ -1041,11 +2186,13 @@ RUN npm run build
 # ---------- Stage 2: Node.js runtime serving API + static assets ----------
 FROM node:20-alpine
 ENV NODE_ENV=production
+ENV DATA_DIR=/data
 WORKDIR /app
 COPY server/package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 COPY server/server.js ./
 COPY --from=frontend-build /build/dist ./public
+RUN mkdir -p /data && chown node:node /data
 EXPOSE 8080
 USER node
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
@@ -1068,11 +2215,18 @@ services:
     environment:
       HA_URL: ${HA_URL:-http://homeassistant.local:8123}
       HA_TOKEN: ${HA_TOKEN:?Set HA_TOKEN in a .env file next to docker-compose.yml}
+    volumes:
+      # Shared dashboard customization (positions, renames, hidden items,
+      # floors, room order) survives container rebuilds here.
+      - hearth3d-data:/data
     # NOTE: mDNS names like `homeassistant.local` usually do NOT resolve inside
     # a container. Prefer setting HA_URL in .env to your Home Assistant host's
     # IP address (e.g. http://192.168.1.50:8123). On Linux you can instead
     # uncomment host networking below and remove the `ports:` section:
     # network_mode: host
+
+volumes:
+  hearth3d-data:
 EOF
 
 # ---------------------------------------------------------------------------
@@ -1090,7 +2244,8 @@ HA_URL=http://192.168.1.50:8123
 HA_TOKEN=
 
 # Optional: comma-separated entity domains to show on the dashboard.
-# DOMAINS=light,switch,media_player,fan,cover,lock,climate,vacuum
+# Add `sensor` to get live sparkline charts for numeric sensors.
+# DOMAINS=light,switch,media_player,fan,cover,lock,climate,vacuum,camera
 EOF
 
 # ---------------------------------------------------------------------------
@@ -1108,6 +2263,7 @@ cat > .gitignore <<'EOF'
 node_modules/
 dist/
 .env
+data/
 EOF
 
 # ---------------------------------------------------------------------------
@@ -1118,13 +2274,15 @@ cat > README.md <<'EOF'
 
 A self-contained, real-time isometric dashboard for Home Assistant. Rooms are
 discovered automatically from your Home Assistant areas; devices appear on
-each room card based on their area assignment, update live, and can be toggled
-with a click.
+each room card based on their area assignment, update live, and can be
+controlled with a click. Everything about the view — positions, names, rooms,
+floors, visibility — can be customized in edit mode, and the customization is
+stored server-side so every browser sees the same dashboard.
 
 ```
-Browser  <-- WebSocket (/ws, port 8080) -->  Node.js backend  <-- HA WebSocket API -->  Home Assistant
-   |                                              |
-   +----------- static React frontend <----------+
+Browser ◄── WebSocket (port 8080) ──► Node.js backend ◄── HA WebSocket API ──► Home Assistant
+   ▲                                        │
+   └───────── static React frontend ◄──────┘
 ```
 
 ## Quick start
@@ -1157,22 +2315,57 @@ Browser  <-- WebSocket (/ws, port 8080) -->  Node.js backend  <-- HA WebSocket A
 
 ## Using the dashboard
 
-- **Toggle devices**: click a light, switch, fan, media player, cover, or lock.
-- **Edit mode**: click *Edit layout* in the header. The view flattens to a
-  top-down floor plan; drag devices to reposition them on their room cards.
-  Positions persist in your browser's local storage. *Reset layout* restores
-  the automatic arrangement.
-- Rooms and devices update automatically when you rename areas or reassign
-  devices in Home Assistant — no restart needed.
+### Everyday control
+
+- **Toggle a device** — click a light, switch, fan, media player, cover, or
+  lock. Active devices glow in their domain color.
+- **Dim / recolor a light** — long-press (or right-click) a light to open its
+  control panel with a brightness slider and color picker.
+- **Floors** — if your Home Assistant areas are assigned to floors (or you
+  created custom floors in edit mode), tabs above the floor plan filter rooms
+  by floor.
+- **Cameras** — camera entities render a live snapshot tile (refreshed every
+  10 s, proxied through the backend so the HA token never reaches the
+  browser).
+- **Sensors** — add `sensor` to the `DOMAINS` environment variable and
+  numeric sensors show their value plus a live sparkline.
+
+### Customization (edit mode)
+
+Click **Edit layout** in the header. The view flattens to a top-down plan and
+everything becomes editable:
+
+| What | How |
+|---|---|
+| Move a device on its card | Drag it |
+| Rename a device / move it to another room / hide it | Click the device |
+| Rename a room / change its floor / hide it | Click the room name |
+| Reorder rooms | ‹ › buttons on each card |
+| Create or delete custom floors | **+ Floor** button / ✕ on a custom floor tab |
+| Restore hidden rooms & devices | **Hidden (n)** button in the header |
+| Start over | **Reset all** |
+
+All customization is stored on the server (in the `hearth3d-data` Docker
+volume) and shared by every browser. Renames and layout changes are pure
+overlays — nothing is ever written back to Home Assistant, and clearing a
+field restores the Home Assistant original. Rooms and devices update
+automatically when you rename areas or reassign devices in Home Assistant.
 
 ## Configuration
+
+All configuration is via environment variables (set them in `.env`):
 
 | Variable   | Default                            | Description                                    |
 |------------|------------------------------------|------------------------------------------------|
 | `HA_URL`   | `http://homeassistant.local:8123`  | Base URL of Home Assistant                     |
 | `HA_TOKEN` | *(required)*                       | Long-lived access token                        |
 | `PORT`     | `8080`                             | Dashboard HTTP/WebSocket port                  |
-| `DOMAINS`  | `light,switch,media_player,fan,cover,lock,climate,vacuum` | Entity domains to display |
+| `DOMAINS`  | `light,switch,media_player,fan,cover,lock,climate,vacuum,camera` | Entity domains to display |
+| `DATA_DIR` | `/data` (in Docker)                | Where the shared layout/customization is saved |
+
+The backend also runs unmodified inside a Home Assistant add-on sandbox: when
+`SUPERVISOR_TOKEN` is present and `HA_URL` is not set, it talks to
+`ws://supervisor/core/websocket` automatically.
 
 ## Local development (without Docker)
 
@@ -1181,7 +2374,7 @@ Browser  <-- WebSocket (/ws, port 8080) -->  Node.js backend  <-- HA WebSocket A
 cd server && npm install
 HA_URL=http://192.168.1.50:8123 HA_TOKEN=... node server.js
 
-# Terminal 2 — frontend with hot reload (proxies /ws to the backend)
+# Terminal 2 — frontend with hot reload (proxies /ws and /api to the backend)
 cd frontend && npm install
 npm run dev
 ```
@@ -1193,20 +2386,23 @@ npm run dev
 - **`HA connection closed; retrying…` forever** — the container cannot reach
   `HA_URL`. Use the IP address, verify port 8123, and check firewalls.
 - **Dashboard is empty** — your entities have no areas. Assign devices to
-  areas in Home Assistant (Settings → Devices & services → Devices).
+  areas in Home Assistant (Settings → Devices & services → Devices). Also
+  check the **Hidden** panel in edit mode.
 - **Only some devices appear** — only domains in `DOMAINS` are shown, and
-  disabled/hidden entities are skipped. Add domains (e.g. `sensor`) via the
-  `DOMAINS` environment variable.
+  disabled/hidden entities are skipped.
+- **Camera tiles show the camera icon instead of an image** — the backend
+  could not fetch `/api/camera_proxy` from Home Assistant; check the logs.
 
 ## Security notes
 
-- The HA token stays server-side; the browser never sees it.
+- The HA token stays server-side; the browser never sees it (camera snapshots
+  are proxied).
 - The dashboard itself has **no authentication** — anyone on your LAN who can
-  reach port 8080 can view and toggle the exposed devices. Do not port-forward
-  it to the internet; put it behind a reverse proxy with auth if you need
-  remote access.
-- Browser clients may only send `toggle` for entities the dashboard exposes;
-  arbitrary Home Assistant service calls are not relayed.
+  reach port 8080 can view and control the exposed devices. Do not
+  port-forward it to the internet; put it behind a reverse proxy with auth if
+  you need remote access.
+- Browser clients can only toggle displayed entities and adjust light
+  brightness/color; arbitrary Home Assistant service calls are not relayed.
 EOF
 
 echo ""
