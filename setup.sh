@@ -1500,7 +1500,7 @@ export default function Room3D({ room, position, size, states, history, position
         }}
         onPointerOut={() => setHovered(false)}
       >
-        <meshStandardMaterial color={lightsOn ? '#1d2a45' : '#16203a'} roughness={0.85} metalness={0.15} />
+        <meshStandardMaterial color={lightsOn ? '#233255' : '#1a2544'} roughness={0.85} metalness={0.15} />
       </RoundedBox>
       <mesh position={[0, WALL_HEIGHT / 2, -size / 2 + WALL_T / 2]} castShadow receiveShadow>
         <boxGeometry args={[size, WALL_HEIGHT, WALL_T]} />
@@ -1549,8 +1549,8 @@ EOF
 # Frontend: frontend/src/components/Scene3D.jsx
 # ---------------------------------------------------------------------------
 cat > frontend/src/components/Scene3D.jsx <<'EOF'
-import { Component } from 'react';
-import { Canvas } from '@react-three/fiber';
+import { Component, useEffect } from 'react';
+import { Canvas, useThree } from '@react-three/fiber';
 import { OrbitControls, Sparkles, Stars, Html } from '@react-three/drei';
 import { EffectComposer, Bloom } from '@react-three/postprocessing';
 import Room3D from './Room3D';
@@ -1604,6 +1604,18 @@ class WebGLBoundary extends Component {
  * bloom on active devices, floating dust, and an orbitable camera that slowly
  * auto-rotates until the user grabs it.
  */
+// Re-frames the camera whenever the scene footprint changes (floor tab
+// switched, rooms added), so the whole stack is always in view initially.
+function CameraRig({ radius, targetY }) {
+  const camera = useThree((state) => state.camera);
+  useEffect(() => {
+    camera.position.set(radius * 1.15, targetY + radius, radius * 1.15);
+    camera.lookAt(0, targetY, 0);
+    camera.updateProjectionMatrix();
+  }, [camera, radius, targetY]);
+  return null;
+}
+
 function Stage({ levels, theme, states, history, positions, onToggle, onOpenLight }) {
   const layouts = levels.map((level) => levelLayout(level.rooms.length));
   const width = Math.max(...layouts.map((l) => l.width));
@@ -1616,9 +1628,10 @@ function Stage({ levels, theme, states, history, positions, onToggle, onOpenLigh
     <Canvas
       shadows
       dpr={[1, 2]}
-      camera={{ position: [radius * 0.95, targetY + radius * 0.9, radius * 0.95], fov: 38 }}
+      camera={{ position: [radius * 1.15, targetY + radius, radius * 1.15], fov: 38 }}
       className="!absolute !inset-0"
     >
+      <CameraRig radius={radius} targetY={targetY} />
       <color attach="background" args={[theme.bg]} />
       <fog attach="fog" args={[theme.bg, radius * 2, radius * 4.5]} />
       <ambientLight intensity={theme.ambient} />
@@ -1703,8 +1716,8 @@ function Stage({ levels, theme, states, history, positions, onToggle, onOpenLigh
         enablePan={false}
         minPolarAngle={0.35}
         maxPolarAngle={1.32}
-        minDistance={radius * 0.5}
-        maxDistance={radius * 2.4}
+        minDistance={radius * 0.45}
+        maxDistance={radius * 2.8}
         target={[0, targetY, 0]}
         autoRotate
         autoRotateSpeed={0.35}
