@@ -790,8 +790,13 @@ body {
   transform: translateZ(30px);
 }
 
+/*
+ * translateZ lifts the billboard fully above the card plane before the
+ * counter-rotation; without it the lower half of every chip sinks below the
+ * semi-transparent card surface and renders dimmed.
+ */
 .device-billboard {
-  transform: translate(-50%, -50%) rotateZ(-45deg) rotateX(-55deg);
+  transform: translate(-50%, -50%) translateZ(48px) rotateZ(-45deg) rotateX(-55deg);
   transition: transform 0.7s cubic-bezier(0.33, 1, 0.68, 1);
 }
 
@@ -1523,11 +1528,11 @@ export default function DeviceNode({
             <Icon domain={device.domain} className="h-5 w-5" />
           )}
         </button>
-        <span className="pointer-events-none max-w-[110px] truncate rounded bg-slate-950/80 px-1.5 py-0.5 text-[10px] leading-tight text-slate-200">
+        <span className="pointer-events-none max-w-[96px] truncate rounded-md bg-slate-900/90 px-1.5 py-0.5 text-[11px] font-medium leading-tight text-slate-100 ring-1 ring-slate-700/60">
           {device.name}
         </span>
         {detail && (
-          <span className="pointer-events-none max-w-[110px] truncate text-[9px] text-slate-400">
+          <span className="pointer-events-none max-w-[96px] truncate text-[10px] text-slate-300">
             {detail}
           </span>
         )}
@@ -1547,15 +1552,17 @@ cat > frontend/src/components/RoomCard.jsx <<'EOF'
 import { useRef } from 'react';
 import DeviceNode from './DeviceNode';
 
-// Arranges devices without a saved position into a padded grid inside the card.
+// Arranges devices without a saved position into a padded grid inside the
+// card. Alternate rows are offset (hex-style packing) so billboarded chips
+// don't stack vertically once the isometric tilt compresses the card.
 function defaultPos(index, count) {
   const cols = Math.max(1, Math.ceil(Math.sqrt(count)));
   const rows = Math.max(1, Math.ceil(count / cols));
   const col = index % cols;
   const row = Math.floor(index / cols);
   return {
-    x: 14 + ((col + 0.5) / cols) * 72,
-    y: 28 + ((row + 0.5) / rows) * 60,
+    x: 12 + ((col + (row % 2 ? 0.65 : 0.35)) / cols) * 76,
+    y: 24 + ((row + 0.5) / rows) * 64,
   };
 }
 
@@ -2082,7 +2089,7 @@ export default function App() {
         </div>
       )}
 
-      <main className="flex flex-1 justify-center px-6 py-20">
+      <main className="flex flex-1 items-center justify-center px-6 py-16">
         {visibleRooms.length === 0 ? (
           <div className="self-center text-center text-slate-500">
             <div className="mb-3 animate-pulse text-4xl">🏠</div>
@@ -2094,10 +2101,10 @@ export default function App() {
           </div>
         ) : (
           <div
-            className={`iso-plane ${editMode ? 'flat' : ''} grid w-full content-start gap-8`}
+            className={`iso-plane ${editMode ? 'flat' : ''} grid w-full gap-8`}
             style={{
               gridTemplateColumns: `repeat(${gridCols}, minmax(0, 1fr))`,
-              maxWidth: `${gridCols * 330}px`,
+              maxWidth: `min(92vw, ${gridCols * 420}px)`,
             }}
           >
             {visibleRooms.map((room) => (
